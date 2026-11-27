@@ -83,7 +83,7 @@ Install optional local language servers / linters only for the languages you use
 ```json
 {
   "mcpServers": {
-    "serena": {
+    "serena-go": {
       "command": "serena-go",
       "args": ["start-mcp-server", "--project", "/path/to/repo"]
     }
@@ -95,7 +95,7 @@ Install optional local language servers / linters only for the languages you use
 ```json
 {
   "mcpServers": {
-    "serena": {
+    "serena-go": {
       "command": "serena-go",
       "args": ["start-mcp-server", "--project", "${workspaceFolder}"]
     }
@@ -105,7 +105,7 @@ Install optional local language servers / linters only for the languages you use
 
 **Codex (`~/.codex/config.toml`):**
 ```toml
-[mcp_servers.serena]
+[mcp_servers.serena-go]
 command = "serena-go"
 args = ["start-mcp-server"]
 ```
@@ -153,7 +153,10 @@ To customize optional features without polluting MCP client configs, create `~/.
   },
   "embeddings": {
     "url": "http://127.0.0.1:18081/v1/embeddings",
-    "model": "nomic-embed-text"
+    "model": "qwen3-embedding-0.6b",
+    "auto_start_cmd": "/path/to/start-embed-gpu.sh --bg --auto",
+    "auto_index_bg": true,
+    "activity_file": "/tmp/serena-embed.act"
   }
 }
 ```

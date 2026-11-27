@@ -2,6 +2,12 @@
 
 All notable changes to `serena-go` are documented in this file.
 
+## [0.2.1] - 2026-11-27
+
+### Added
+- **Zero-Touch Auto GPU Lifecycle:** Optional `embeddings.auto_start_cmd` and `embeddings.activity_file` in `config.json` automatically wake on-demand embedding servers on the first search (rate-limited, non-blocking fallback) and touch activity timestamps so idle watchdogs can reclaim VRAM automatically.
+- **Auto Background 100% Corpus Indexing:** Interactive `semantic_code_search` automatically spawns a global `flock`-guarded background worker (`serena-go index --embed --bg-auto`) at gentle concurrency (`2 workers × batch=16`) whenever a repository has `<100%` vector coverage, bringing large repositories to full corpus GPU recall automatically with zero manual commands.
+
 ## [0.2.0] - 2026-11-27
 
 ### Added

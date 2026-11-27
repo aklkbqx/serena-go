@@ -19,12 +19,13 @@ if grep -rnE --exclude-dir=.git --exclude-dir=dist --exclude="check-oss-hygiene.
 fi
 echo "OK: zero leaked paths, private IPs, or secrets"
 
-echo "=== 3. Running go vet & go test -race ==="
-go vet ./...
-go test -race -count=1 ./...
+BUILD_TAGS="grammar_subset,grammar_subset_go,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript,grammar_subset_python,grammar_subset_rust,grammar_subset_swift,grammar_subset_c,grammar_subset_cpp,grammar_subset_objc,grammar_subset_java,grammar_subset_kotlin,grammar_subset_sql,grammar_subset_bash,grammar_subset_ruby,grammar_subset_php,grammar_subset_vue,grammar_subset_svelte,grammar_subset_json,grammar_subset_yaml,grammar_subset_toml,grammar_subset_markdown,grammar_subset_css,grammar_subset_html,grammar_subset_dockerfile"
+
+echo "=== 3. Running go vet & go test -race (with grammar_subset tags) ==="
+go vet -tags "$BUILD_TAGS" ./...
+go test -race -tags "$BUILD_TAGS" -count=1 ./...
 
 echo "=== 4. Verifying CGO_ENABLED=0 cross-compilation matrix (grammar_subset) ==="
-BUILD_TAGS="grammar_subset,grammar_subset_go,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript,grammar_subset_python,grammar_subset_rust,grammar_subset_swift,grammar_subset_c,grammar_subset_cpp,grammar_subset_objc,grammar_subset_java,grammar_subset_kotlin,grammar_subset_sql,grammar_subset_bash,grammar_subset_ruby,grammar_subset_php,grammar_subset_vue,grammar_subset_svelte,grammar_subset_json,grammar_subset_yaml,grammar_subset_toml,grammar_subset_markdown,grammar_subset_css,grammar_subset_html,grammar_subset_dockerfile"
 TMP_OUT="$(mktemp -d)"
 trap 'rm -rf "$TMP_OUT"' EXIT
 for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do

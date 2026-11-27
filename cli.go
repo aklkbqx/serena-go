@@ -48,7 +48,7 @@ Environment & Config:
 
 func runDoctor() int {
 	fmt.Printf("serena-go %s (%s, %s/%s)\n", buildVersion, buildCommit, runtime.GOOS, runtime.GOARCH)
-	cfg, cfgPath := loadUserConfig()
+	_, cfgPath := loadUserConfig()
 	if cfgPath != "" {
 		fmt.Printf("Config:          %s\n", cfgPath)
 	} else {
@@ -106,15 +106,11 @@ func runDoctor() int {
 	}
 
 	fmt.Println("\nHybrid GPU Semantic Embeddings:")
-	if ep := resolveEmbedEndpoint(); ep != "" {
-		model := strings.TrimSpace(os.Getenv("SERENA_EMBED_MODEL"))
-		if model == "" {
-			model = strings.TrimSpace(cfg.Embeddings.Model)
-		}
-		if model == "" {
-			model = "nomic-embed-text"
-		}
+	if ep := resolveEmbedEndpointWithAutoStart(false); ep != "" {
+		model := configuredEmbedModel()
 		fmt.Printf("  [ok] READY %s (model=%s)\n", ep, model)
+	} else if startCmd := embedAutoStartCmd(); startCmd != "" {
+		fmt.Printf("  [ok] standby (auto-starts on demand via config; idle auto-unload active)\n")
 	} else {
 		fmt.Println("  [--] offline (using local Pure-Go AST-BM25; set SERENA_EMBED_URL to enable GPU vectors)")
 	}

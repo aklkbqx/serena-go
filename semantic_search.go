@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -605,7 +606,87 @@ func ensureFreshSidx(repoRoot string) (*sidxMmapHandle, error) {
 
 // --- OpenAI-Compatible GPU Embeddings (Base64 + Model-Aware Prefixes + 4-Worker Batch=32) ---
 
+func touchEmbedActivity() {
+	actPath := strings.TrimSpace(os.Getenv("SERENA_EMBED_ACTIVITY_FILE"))
+	if actPath == "" {
+		cfg, _ := loadUserConfig()
+		actPath = strings.TrimSpace(cfg.Embeddings.ActivityFile)
+	}
+	if actPath == "" {
+		return
+	}
+	now := time.Now()
+	if err := os.Chtimes(actPath, now, now); err != nil {
+		_ = os.WriteFile(actPath, []byte("1\n"), 0o600)
+	}
+}
+
+func embedAutoIndexEnabled() bool {
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("SERENA_EMBED_AUTO_INDEX"))); v != "" {
+		return v != "0" && v != "false" && v != "off"
+	}
+	cfg, _ := loadUserConfig()
+	if cfg.Embeddings.AutoIndexBG != nil {
+		return *cfg.Embeddings.AutoIndexBG
+	}
+	return true
+}
+
+func embedAutoStartCmd() string {
+	if v := strings.TrimSpace(os.Getenv("SERENA_EMBED_AUTO_START_CMD")); v != "" {
+		if strings.EqualFold(v, "off") || v == "0" || strings.EqualFold(v, "false") {
+			return ""
+		}
+		return v
+	}
+	cfg, _ := loadUserConfig()
+	return strings.TrimSpace(cfg.Embeddings.AutoStartCmd)
+}
+
+func embedEndpointHTTPReady(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	hostPort := u.Host
+	if !strings.Contains(hostPort, ":") {
+		if u.Scheme == "https" {
+			hostPort += ":443"
+		} else {
+			hostPort += ":80"
+		}
+	}
+	if !tcpReachableFast(hostPort, 180*time.Millisecond) {
+		return false
+	}
+	// Verify HTTP readiness so an open SSH tunnel (EOF) or loading llama-server (HTTP 503) is not mistaken for ready.
+	client := &http.Client{Timeout: 450 * time.Millisecond}
+	healthURL := fmt.Sprintf("%s://%s/health", u.Scheme, u.Host)
+	resp, err := client.Get(healthURL)
+	if err != nil {
+		return false
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusGatewayTimeout {
+		return false
+	}
+	return true
+}
+
+func probeEmbedCandidates(candidates []string) string {
+	for _, raw := range candidates {
+		if embedEndpointHTTPReady(raw) {
+			return raw
+		}
+	}
+	return ""
+}
+
 func resolveEmbedEndpoint() string {
+	return resolveEmbedEndpointWithAutoStart(true)
+}
+
+func resolveEmbedEndpointWithAutoStart(allowAutoStart bool) string {
 	v := strings.TrimSpace(os.Getenv("SERENA_EMBED_URL"))
 	if strings.EqualFold(v, "off") || v == "0" || strings.EqualFold(v, "false") {
 		return ""
@@ -624,24 +705,90 @@ func resolveEmbedEndpoint() string {
 			candidates = append(candidates, "http://127.0.0.1:18081/v1/embeddings")
 		}
 	}
-	for _, raw := range candidates {
-		u, err := url.Parse(raw)
-		if err != nil || u.Host == "" {
-			continue
-		}
-		hostPort := u.Host
-		if !strings.Contains(hostPort, ":") {
-			if u.Scheme == "https" {
-				hostPort += ":443"
-			} else {
-				hostPort += ":80"
+	if ep := probeEmbedCandidates(candidates); ep != "" {
+		touchEmbedActivity()
+		return ep
+	}
+	if !allowAutoStart {
+		return ""
+	}
+	startCmd := embedAutoStartCmd()
+	if startCmd == "" {
+		return ""
+	}
+	// Rate-limit auto-start attempts to at most once every 60s (avoids repeated SSH checks when remote is offline/busy).
+	stamp := filepath.Join(os.TempDir(), fmt.Sprintf("serena-embed-autostart-%d.ts", os.Getuid()))
+	if st, err := os.Stat(stamp); err == nil && time.Since(st.ModTime()) < 60*time.Second {
+		return ""
+	}
+	_ = os.WriteFile(stamp, []byte("1\n"), 0o600)
+
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err == nil {
+		cmd := exec.Command("/bin/sh", "-c", startCmd)
+		cmd.Stdin = devNull
+		cmd.Stdout = devNull
+		cmd.Stderr = devNull
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		startErr := cmd.Start()
+		_ = devNull.Close()
+		if startErr == nil {
+			doneCh := make(chan struct{})
+			go func() {
+				_ = cmd.Wait()
+				close(doneCh)
+			}()
+			// Wait up to 4.5s for fast GPU cold-boot; bail immediately if helper exits without starting GPU.
+			deadline := time.Now().Add(4500 * time.Millisecond)
+			for time.Now().Before(deadline) {
+				if ep := probeEmbedCandidates(candidates); ep != "" {
+					touchEmbedActivity()
+					return ep
+				}
+				select {
+				case <-doneCh:
+					if ep := probeEmbedCandidates(candidates); ep != "" {
+						touchEmbedActivity()
+						return ep
+					}
+					return ""
+				case <-time.After(200 * time.Millisecond):
+				}
 			}
-		}
-		if tcpReachableFast(hostPort, 180*time.Millisecond) {
-			return raw
 		}
 	}
 	return ""
+}
+
+func triggerBackgroundRepoEmbed(repoRoot string) {
+	if !embedAutoIndexEnabled() || isForbiddenIndexRoot(repoRoot) {
+		return
+	}
+	sum := sha256.Sum256([]byte(canonicalPath(repoRoot)))
+	stamp := filepath.Join(os.TempDir(), fmt.Sprintf("serena-bg-idx-%d-%s.ts", os.Getuid(), hex.EncodeToString(sum[:])[:10]))
+	if st, err := os.Stat(stamp); err == nil && time.Since(st.ModTime()) < 5*time.Minute {
+		return
+	}
+	_ = os.WriteFile(stamp, []byte("1\n"), 0o600)
+
+	selfExe, err := os.Executable()
+	if err != nil || selfExe == "" {
+		return
+	}
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return
+	}
+	cmd := exec.Command(selfExe, "index", "--embed", "--bg-auto", canonicalPath(repoRoot))
+	cmd.Stdin = devNull
+	cmd.Stdout = devNull
+	cmd.Stderr = devNull
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	startErr := cmd.Start()
+	_ = devNull.Close()
+	if startErr == nil {
+		go func() { _ = cmd.Wait() }()
+	}
 }
 
 func configuredEmbedModel() string {
@@ -757,12 +904,23 @@ func fetchEmbeddingsBatch(client *http.Client, endpoint, model string, inputs []
 }
 
 func fetchEmbeddings(endpoint string, inputs []string) ([][]float32, string, error) {
+	return fetchEmbeddingsWithConcurrency(endpoint, inputs, maxEmbedBatch, 4)
+}
+
+func fetchEmbeddingsWithConcurrency(endpoint string, inputs []string, batchSize, maxWorkers int) ([][]float32, string, error) {
 	if len(inputs) == 0 {
 		return nil, "", nil
 	}
+	if batchSize <= 0 {
+		batchSize = maxEmbedBatch
+	}
+	if maxWorkers <= 0 {
+		maxWorkers = 4
+	}
+	touchEmbedActivity()
 	model := configuredEmbedModel()
-	client := &http.Client{Timeout: 20 * time.Second}
-	if len(inputs) <= maxEmbedBatch {
+	client := &http.Client{Timeout: 25 * time.Second}
+	if len(inputs) <= batchSize {
 		return fetchEmbeddingsBatch(client, endpoint, model, inputs)
 	}
 
@@ -771,15 +929,15 @@ func fetchEmbeddings(endpoint string, inputs []string) ([][]float32, string, err
 		end   int
 	}
 	var tasks []batchTask
-	for s := 0; s < len(inputs); s += maxEmbedBatch {
-		e := s + maxEmbedBatch
+	for s := 0; s < len(inputs); s += batchSize {
+		e := s + batchSize
 		if e > len(inputs) {
 			e = len(inputs)
 		}
 		tasks = append(tasks, batchTask{start: s, end: e})
 	}
 
-	workers := 4
+	workers := maxWorkers
 	if len(tasks) < workers {
 		workers = len(tasks)
 	}
@@ -807,6 +965,7 @@ func fetchEmbeddings(endpoint string, inputs []string) ([][]float32, string, err
 				if failed {
 					return
 				}
+				touchEmbedActivity()
 				vecs, m, err := fetchEmbeddingsBatch(client, endpoint, model, inputs[t.start:t.end])
 				mu.Lock()
 				if err != nil {
@@ -1154,6 +1313,10 @@ func toolSemanticCodeSearch(repoRoot string, args map[string]any) (string, error
 				}
 			}
 			modeTag = fmt.Sprintf("Hybrid BM25 + GPU Vector (%s, %d%% vec)", resolvedModel, covPct)
+			// Auto-embed remaining corpus chunks in a singleflight-locked background worker so future queries get 100% recall automatically.
+			if embeddedTotal < numChunks && numChunks > 64 {
+				triggerBackgroundRepoEmbed(repoRoot)
+			}
 		}
 	}
 
@@ -1230,14 +1393,18 @@ func toolSemanticCodeSearch(repoRoot string, args map[string]any) (string, error
 	return truncateAnswer(strings.TrimSpace(out.String()), maxChars), nil
 }
 
-// runIndexCLI implements `serena-go index [--embed] [repo]` to pre-build V2 mmap + 100% corpus GPU vectors.
+// runIndexCLI implements `serena-go index [--embed] [--bg-auto] [repo]` to pre-build V2 mmap + 100% corpus GPU vectors.
 func runIndexCLI(args []string) int {
 	doEmbed := false
+	bgAuto := false
 	repo := ""
 	for _, a := range args {
-		if a == "--embed" {
+		switch {
+		case a == "--embed":
 			doEmbed = true
-		} else if !strings.HasPrefix(a, "-") {
+		case a == "--bg-auto":
+			bgAuto = true
+		case !strings.HasPrefix(a, "-"):
 			repo = a
 		}
 	}
@@ -1246,21 +1413,45 @@ func runIndexCLI(args []string) int {
 		repo = cwd
 	}
 	repo = canonicalPath(repo)
+
+	// Background auto-indexer enforces a global non-blocking flock so at most 1 repo embeds at a time.
+	if bgAuto {
+		lockPath := filepath.Join(os.TempDir(), fmt.Sprintf("serena-embed-worker-%d.lock", os.Getuid()))
+		lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return 0
+		}
+		if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			_ = lf.Close()
+			return 0 // another background repo embed is already active
+		}
+		defer func() {
+			_ = syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
+			_ = lf.Close()
+		}()
+	}
+
 	t0 := time.Now()
 	h, err := ensureFreshSidx(repo)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "index error: %v\n", err)
+		if !bgAuto {
+			fmt.Fprintf(os.Stderr, "index error: %v\n", err)
+		}
 		return 1
 	}
-	fmt.Printf("AST V2 mmap index ready: %s (%d files, %d chunks, skipped=%d large/%d cap) in %s\n",
-		h.path, len(h.meta.Files), len(h.meta.Chunks), h.meta.SkippedTooLarge, h.meta.SkippedCap, time.Since(t0).Round(time.Millisecond))
+	if !bgAuto {
+		fmt.Printf("AST V2 mmap index ready: %s (%d files, %d chunks, skipped=%d large/%d cap) in %s\n",
+			h.path, len(h.meta.Files), len(h.meta.Chunks), h.meta.SkippedTooLarge, h.meta.SkippedCap, time.Since(t0).Round(time.Millisecond))
+	}
 
 	if !doEmbed {
 		return 0
 	}
-	embedURL := resolveEmbedEndpoint()
+	embedURL := resolveEmbedEndpointWithAutoStart(!bgAuto)
 	if embedURL == "" {
-		fmt.Fprintln(os.Stderr, "embedding endpoint offline (set SERENA_EMBED_URL or start embedding server)")
+		if !bgAuto {
+			fmt.Fprintln(os.Stderr, "embedding endpoint offline (set SERENA_EMBED_URL or start embedding server)")
+		}
 		return 1
 	}
 	cfgModel := configuredEmbedModel()
@@ -1282,15 +1473,26 @@ func runIndexCLI(args []string) int {
 		inputs = append(inputs, formatEmbedInput(cfgModel, truncateUTF8(docTxt, 1000), false))
 	}
 	if len(missingIdx) == 0 {
-		fmt.Printf("All %d chunks already embedded (model=%s, dim=%d).\n", len(h.meta.Chunks), h.meta.EmbedModel, h.embedDim)
+		if !bgAuto {
+			fmt.Printf("All %d chunks already embedded (model=%s, dim=%d).\n", len(h.meta.Chunks), h.meta.EmbedModel, h.embedDim)
+		}
 		return 0
 	}
-	fmt.Printf("Embedding %d/%d chunks via %s (model=%s, 4 workers x batch=%d, base64)...\n",
-		len(missingIdx), len(h.meta.Chunks), embedURL, cfgModel, maxEmbedBatch)
+	batchSz, workers := maxEmbedBatch, 4
+	if bgAuto {
+		// Gentle background throughput so interactive searches and desktop apps stay snappy
+		batchSz, workers = 16, 2
+	}
+	if !bgAuto {
+		fmt.Printf("Embedding %d/%d chunks via %s (model=%s, %d workers x batch=%d, base64)...\n",
+			len(missingIdx), len(h.meta.Chunks), embedURL, cfgModel, workers, batchSz)
+	}
 	t1 := time.Now()
-	vecs, resolvedModel, err := fetchEmbeddings(embedURL, inputs)
+	vecs, resolvedModel, err := fetchEmbeddingsWithConcurrency(embedURL, inputs, batchSz, workers)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "embedding failed: %v\n", err)
+		if !bgAuto {
+			fmt.Fprintf(os.Stderr, "embedding failed: %v\n", err)
+		}
 		return 1
 	}
 	dim := len(vecs[0])
@@ -1299,17 +1501,21 @@ func runIndexCLI(args []string) int {
 		newVecs[ci] = vecs[k]
 	}
 	if err := persistChunkEmbeddings(repo, h, resolvedModel, dim, newVecs); err != nil {
-		fmt.Fprintf(os.Stderr, "persist failed: %v\n", err)
+		if !bgAuto {
+			fmt.Fprintf(os.Stderr, "persist failed: %v\n", err)
+		}
 		return 1
 	}
-	dt := time.Since(t1)
-	rate := float64(len(missingIdx)) / dt.Seconds()
-	fi, _ := os.Stat(sidxPath(repo))
-	szMB := float64(0)
-	if fi != nil {
-		szMB = float64(fi.Size()) / (1024 * 1024)
+	if !bgAuto {
+		dt := time.Since(t1)
+		rate := float64(len(missingIdx)) / dt.Seconds()
+		fi, _ := os.Stat(sidxPath(repo))
+		szMB := float64(0)
+		if fi != nil {
+			szMB = float64(fi.Size()) / (1024 * 1024)
+		}
+		fmt.Printf("Embedded %d chunks (model=%s, dim=%d SQ8) in %s (%.1f chunks/s) -> %.2f MB mmap index\n",
+			len(missingIdx), resolvedModel, dim, dt.Round(time.Millisecond), rate, szMB)
 	}
-	fmt.Printf("Embedded %d chunks (model=%s, dim=%d SQ8) in %s (%.1f chunks/s) -> %.2f MB mmap index\n",
-		len(missingIdx), resolvedModel, dim, dt.Round(time.Millisecond), rate, szMB)
 	return 0
 }

@@ -17,9 +17,10 @@ llama-server \
   --pooling last \
   --host 127.0.0.1 \
   --port 18081 \
-  --ctx-size 8192 \
-  --batch-size 8192 \
-  --ubatch-size 8192 \
+  --ctx-size 4096 \
+  --batch-size 2048 \
+  --ubatch-size 2048 \
+  --parallel 4 \
   -ngl 99
 ```
 
@@ -51,3 +52,23 @@ serena-go index --embed /path/to/repo
 ```
 
 Vectors are stored as **full-dimension SQ8 (`int8`)** off-heap in the `.sidx` `mmap` file (`100% Recall@5` vs float32, `4×` smaller than float32), automatically invalidated whenever you switch models or dimensions, and scanned in `~2–4 ms` across the entire repository.
+
+## Zero-Touch Auto-Start, Idle Unload & Auto-Indexing
+
+Configure `~/.config/serena-go/config.json` so you never need to start the GPU server or run `index --embed` manually:
+
+```json
+{
+  "embeddings": {
+    "url": "http://127.0.0.1:18081/v1/embeddings",
+    "model": "qwen3-embedding-0.6b",
+    "auto_start_cmd": "/path/to/start-embed-gpu.sh --bg --auto",
+    "auto_index_bg": true,
+    "activity_file": "/tmp/serena-embed.act"
+  }
+}
+```
+
+- **`auto_start_cmd`**: Triggered automatically (at most once per 60s) on the first `semantic_code_search` when the endpoint is offline; waits up to 4.5s for HTTP `/health` readiness and falls back immediately to local BM25 if the helper exits without starting the GPU.
+- **`activity_file`**: Touched on every embedding call so an external idle watchdog can unload GPU VRAM after inactivity.
+- **`auto_index_bg`** (default `true`): Whenever a repo has `<100%` vector coverage while the embedding endpoint is online, spawns a singleflight-locked background worker (`serena-go index --embed --bg-auto`) using gentle concurrency (`2 workers × batch=16`).

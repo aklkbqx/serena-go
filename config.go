@@ -15,8 +15,11 @@ type remoteLSPConfig struct {
 }
 
 type embeddingsConfig struct {
-	URL   string `json:"url,omitempty"`
-	Model string `json:"model,omitempty"`
+	URL          string `json:"url,omitempty"`
+	Model        string `json:"model,omitempty"`
+	AutoStartCmd string `json:"auto_start_cmd,omitempty"` // optional shell command to launch embedding server on demand
+	AutoIndexBG  *bool  `json:"auto_index_bg,omitempty"`  // default true: auto-embed remaining chunks in background
+	ActivityFile string `json:"activity_file,omitempty"`  // optional timestamp file touched on embed calls (for idle reaper)
 }
 
 type userConfig struct {

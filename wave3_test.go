@@ -231,6 +231,10 @@ export function rotateJwtGrant(userId: string): string {
 	// 2. Hybrid BM25 + GPU Vector RRF via mock OpenAI /v1/embeddings server
 	embedCalls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		embedCalls++
 		var req struct {
 			Model string   `json:"model"`
@@ -425,5 +429,38 @@ func (m *Map[K, V]) Lookup(k K) (V, bool) {
 	gotPaths := extractPathsFromHookPayload(patchPayload, "/repo")
 	if len(gotPaths) != 2 || gotPaths[0] != "/repo/src/auth.ts" || gotPaths[1] != "/repo/src/new.go" {
 		t.Fatalf("unexpected apply_patch paths: %v", gotPaths)
+	}
+}
+
+func TestEmbedAutoStartAndActivityConfig(t *testing.T) {
+	dir := t.TempDir()
+	actFile := filepath.Join(dir, "embed.act")
+	cfgFile := filepath.Join(dir, "config.json")
+	cfgJSON := `{"embeddings":{"url":"http://127.0.0.1:18081/v1/embeddings","model":"qwen3-embedding-0.6b","auto_start_cmd":"true","auto_index_bg":false,"activity_file":"` + actFile + `"}}`
+	if err := os.WriteFile(cfgFile, []byte(cfgJSON), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("SERENA_CONFIG", cfgFile)
+	t.Setenv("SERENA_EMBED_AUTO_INDEX", "")
+	t.Setenv("SERENA_EMBED_AUTO_START_CMD", "")
+
+	if embedAutoIndexEnabled() {
+		t.Fatalf("expected auto_index_bg=false from config.json")
+	}
+	if got := embedAutoStartCmd(); got != "true" {
+		t.Fatalf("expected auto_start_cmd='true', got %q", got)
+	}
+	touchEmbedActivity()
+	if _, err := os.Stat(actFile); err != nil {
+		t.Fatalf("expected touchEmbedActivity to create %s: %v", actFile, err)
+	}
+	// Env overrides re-enable auto_index_bg and disable auto_start_cmd
+	t.Setenv("SERENA_EMBED_AUTO_INDEX", "1")
+	t.Setenv("SERENA_EMBED_AUTO_START_CMD", "off")
+	if !embedAutoIndexEnabled() {
+		t.Fatalf("expected SERENA_EMBED_AUTO_INDEX=1 override")
+	}
+	if got := embedAutoStartCmd(); got != "" {
+		t.Fatalf("expected SERENA_EMBED_AUTO_START_CMD=off override, got %q", got)
 	}
 }
