@@ -9,10 +9,14 @@
 - Consumes `0 MB` extra RAM and completes in `<3 ms`.
 - Enforces symlink-resolved workspace containment (`evalSymlinksNearestAncestor`) on every path.
 
-### Tier 1 — Stateless AST & Hybrid Search (`tier1_ast.go`, `context_pack.go`, `semantic_search.go`)
-- Uses `github.com/odvcencio/gotreesitter` (pure Go, `CGO_ENABLED=0`) to parse files on demand and release AST memory immediately after returning.
-- **`code_context_pack`** combines symbol definition body, 1-hop imported definitions/signatures, callers (warm LSP if available, else fast `rg`), and quick diagnostics into one compact response.
-- **`semantic_code_search`** maintains an incremental content-hashed AST chunk cache in `os.UserCacheDir()/serena-index/<repoHash>.json`. It ranks chunks using code-aware CamelCase/snake_case BM25 + engineering domain synonyms, and when an OpenAI-compatible `/v1/embeddings` endpoint is live, embeds the query and uncached top-40 candidate chunks in safe sub-batches (`<=8`) and merges ranks via Reciprocal Rank Fusion (RRF).
+### Tier 1 — Stateless AST, V2 `mmap` Index & Diff Symbols (`tier1_ast.go`, `context_pack.go`, `sidx_mmap.go`, `semantic_search.go`, `changed_symbols.go`)
+- Uses `github.com/odvcencio/gotreesitter` (`ParseFilePooled`, pure Go, `CGO_ENABLED=0`, compiled with curated `grammar_subset` tags for a lean `~19 MB` binary) with a tiny 32-file mtime cache and idle `PurgeEmbeddedLanguageCache()` (lock-free tokenization hot path).
+- **`code_context_pack`** (supports single or batch `symbols: [...]`) executes stages in parallel: definition body, same-file + imported type bodies (resolving `tsconfig.json` `@/*` aliases and Go intra-repo module imports), outgoing local callees, production-first callers, warm LSP `hover`, and quick diagnostics.
+- **`changed_symbols`** parses `git diff`/staged hunks and maps them to affected AST symbols, callers, and live diagnostics.
+- **`semantic_code_search`** uses a V2 Pure-Go read-only `syscall.Mmap` binary index (`os.UserCacheDir()/serena-index/<repoHash>.sidx`) shared across concurrent MCP sessions (`0` duplicated RSS):
+  - Precomputed inverted posting list + symbol table (`<6 ms` BM25, `<1 ms` exact `find_symbol`) with Thai `unicode.Mn` + 3–4 grapheme n-gram tokenization and English stemming.
+  - Full-dimension SQ8 (`int8`) flat vector matrix (`100% Recall@5`, `~2 ms` full-corpus scan) populated on the fly or 100% via `serena-go index --embed` (4-worker `batch=32` `base64`), merged with BM25 via Dual-Channel Reciprocal Rank Fusion (RRF).
+  - Refuses to crawl `$HOME` / `/` / `/tmp` / `/Volumes`, honors `.gitignore` via `rg --files`, and reports skipped/capped file counts transparently.
 
 ### Tier 2 — Shared Lazy LSP Supervisor (`tier2_lsp.go`, `remote_lsp.go`)
 - Spawns at most one background supervisor per `(canonicalRepoRoot, lang)` over a user-private Unix domain socket (`0700`). Multiple concurrent AI sessions share the exact same warm LSP instance.

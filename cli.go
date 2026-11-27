@@ -24,12 +24,14 @@ func printUsage() {
 	fmt.Print(`serena-go — Pure-Go 3-Tier Code-Intelligence MCP Server
 
 Usage:
-  serena-go start-mcp-server [--project <dir>]   Start stdio MCP server (Serena-compatible)
-  serena-go check-file <path>                    Fast AST + linter + warm-LSP diagnostics
-  serena-go doctor                               Inspect AST, LSPs, remote offload, embeddings & RAM policy
-  serena-go status                               List active shared LSP daemons
-  serena-go stop-lsp                             Gracefully stop all active shared LSP daemons
-  serena-go version                              Print version and build info
+  serena-go start-mcp-server [--project <dir>] [--profile full|slim]   Start stdio MCP server
+  serena-go check-file <path>                                          Fast AST + linter + warm-LSP diagnostics
+  serena-go index [--embed] [repo]                                     Build V2 mmap AST + optional 100% GPU SQ8 vector index
+  serena-go hook <post-edit|session-brief|remind> [--client=...]       Zero-jq fast client hooks (<6ms)
+  serena-go doctor                                                     Inspect AST, LSPs, remote offload, embeddings & RAM policy
+  serena-go status                                                     List active shared LSP daemons
+  serena-go stop-lsp                                                   Gracefully stop all active shared LSP daemons
+  serena-go version                                                    Print version and build info
 
 Environment & Config:
   SERENA_CONFIG                  Path to JSON config (default: ~/.config/serena-go/config.json)

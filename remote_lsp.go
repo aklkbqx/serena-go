@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -125,6 +127,20 @@ func resolveRemoteLSPTarget(localRepoRoot, lang string) *remoteLSPTarget {
 		remoteRoot = prefix + "/" + base
 	}
 
+	// Check 5-minute disk cache for SSH preflight to avoid redundant SSH roundtrips.
+	preflightKey := fmt.Sprintf("%s\n%s\n%s", host, remoteRoot, lang)
+	if ok, cached := readRemotePreflightCache(preflightKey, 5*time.Minute); cached {
+		if !ok {
+			return nil
+		}
+		return &remoteLSPTarget{
+			HostAlias:  host,
+			ProbeAddr:  probeAddr,
+			RemoteRoot: remoteRoot,
+			RemoteCmd:  remoteCmd,
+		}
+	}
+
 	// Single fast SSH preflight (<2s) confirming remote dir exists and binary is executable.
 	checkScript := fmt.Sprintf(`%s; [ -d %s ] && command -v %s >/dev/null 2>&1 && echo OK`,
 		remoteExportPATH,
@@ -139,7 +155,9 @@ func resolveRemoteLSPTarget(localRepoRoot, lang string) *remoteLSPTarget {
 		"-T", host, checkScript,
 	)
 	out, err := cmd.Output()
-	if err != nil || !strings.Contains(string(out), "OK") {
+	preflightOK := err == nil && strings.Contains(string(out), "OK")
+	writeRemotePreflightCache(preflightKey, preflightOK)
+	if !preflightOK {
 		return nil
 	}
 	return &remoteLSPTarget{
@@ -148,6 +166,44 @@ func resolveRemoteLSPTarget(localRepoRoot, lang string) *remoteLSPTarget {
 		RemoteRoot: remoteRoot,
 		RemoteCmd:  remoteCmd,
 	}
+}
+
+func remotePreflightCachePath(key string) string {
+	dir := lspStateDir()
+	h := sha256.Sum256([]byte(key))
+	return filepath.Join(dir, "_preflight_"+hex.EncodeToString(h[:])[:12]+".cache")
+}
+
+func readRemotePreflightCache(key string, ttl time.Duration) (ok bool, hit bool) {
+	p := remotePreflightCachePath(key)
+	info, err := os.Stat(p)
+	if err != nil || time.Since(info.ModTime()) > ttl {
+		return false, false
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return false, false
+	}
+	s := strings.TrimSpace(string(raw))
+	if s == "1" {
+		return true, true
+	}
+	if s == "0" {
+		return false, true
+	}
+	return false, false
+}
+
+func writeRemotePreflightCache(key string, ok bool) {
+	dir := lspStateDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	val := "0"
+	if ok {
+		val = "1"
+	}
+	_ = os.WriteFile(remotePreflightCachePath(key), []byte(val), 0o600)
 }
 
 func buildRemoteLSPSpec(lang string, target *remoteLSPTarget) *lspLangSpec {

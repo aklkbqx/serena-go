@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -269,9 +271,9 @@ export function rotateJwtGrant(userId: string): string {
 	}
 
 	// 3. Verify fetchEmbeddings splits large input lists into safe GPU sub-batches (<= maxEmbedBatch)
-	batchCalls := 0
+	var batchCalls atomic.Int32
 	srvBatch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		batchCalls++
+		batchCalls.Add(1)
 		var req struct {
 			Input []string `json:"input"`
 		}
@@ -288,7 +290,7 @@ export function rotateJwtGrant(userId: string): string {
 	}))
 	defer srvBatch.Close()
 
-	inputs := make([]string, 19)
+	inputs := make([]string, 70)
 	for i := range inputs {
 		inputs[i] = "search_document: chunk"
 	}
@@ -296,10 +298,132 @@ export function rotateJwtGrant(userId: string): string {
 	if err != nil {
 		t.Fatalf("fetchEmbeddings sub-batch failed: %v", err)
 	}
-	if len(embs) != 19 || model != "nomic-embed-text" {
+	if len(embs) != 70 || model != "nomic-embed-text" {
 		t.Fatalf("unexpected sub-batch result: len=%d model=%q", len(embs), model)
 	}
-	if batchCalls != 3 {
-		t.Fatalf("expected 3 sub-batches for 19 inputs (8+8+3), got %d", batchCalls)
+	if got := batchCalls.Load(); got != 3 {
+		t.Fatalf("expected 3 sub-batches for 70 inputs (32+32+6), got %d", got)
+	}
+}
+
+func TestHomeIndexPrivacyGuard(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" {
+		if !isForbiddenIndexRoot(home) {
+			t.Fatalf("expected $HOME %q to be blocked from indexing", home)
+		}
+	}
+	if !isForbiddenIndexRoot("/") {
+		t.Fatalf("expected / to be blocked from indexing")
+	}
+	repo := t.TempDir()
+	if isForbiddenIndexRoot(repo) {
+		t.Fatalf("expected temp repo dir %q to be allowed", repo)
+	}
+}
+
+func TestThaiTokenizerUTF8AndSQ8Mmap(t *testing.T) {
+	// 1. UTF-8 safe truncation never creates replacement runes (\ufffd)
+	thai := "ระบบยืนยันตัวตนและโทเค็นสำหรับผู้ใช้งานทั้งหมดในโปรเจกต์"
+	cut := truncateUTF8(thai, 17)
+	if strings.ContainsRune(cut, '\uFFFD') {
+		t.Fatalf("truncateUTF8 produced invalid UTF-8: %q", cut)
+	}
+
+	// 2. Thai tokenizer preserves unicode.Mn combining marks and produces 3-4 grapheme n-grams
+	toks := tokenizeCode("ระบบยืนยันตัวตน authToken")
+	joined := strings.Join(toks, " ")
+	if !strings.Contains(joined, "ยืน") || !strings.Contains(joined, "ตัวตน") || !strings.Contains(joined, "auth") || !strings.Contains(joined, "token") {
+		t.Fatalf("unexpected Thai+Code tokens: %v", toks)
+	}
+
+	// 3. SQ8 quantization preserves >0.995 cosine similarity with float32
+	v1 := []float32{0.82, -0.31, 0.44, 0.19, -0.77, 0.55, 0.12, -0.64}
+	v2 := []float32{0.79, -0.28, 0.49, 0.21, -0.73, 0.50, 0.10, -0.60}
+	wantCos := cosineSim(v1, v2)
+	q1, s1 := quantizeUnitSQ8(v1)
+	deq1 := make([]float32, len(q1))
+	for i, b := range q1 {
+		deq1[i] = float32(b) * s1
+	}
+	gotCos := cosineSim(deq1, v2)
+	diff := wantCos - gotCos
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > 0.01 {
+		t.Fatalf("SQ8 cosine drift too large: want %.4f got %.4f", wantCos, gotCos)
+	}
+}
+
+func TestASTFixesExactMutationSafetyAndUTF16(t *testing.T) {
+	repo := t.TempDir()
+	goSrc := `package demo
+
+const Version = "1.0.0"
+
+var GlobalFlag = true
+
+type Map[K comparable, V any] struct {
+	Items map[K]V
+}
+
+func (m *Map[K, V]) Lookup(k K) (V, bool) {
+	v, ok := m.Items[k]
+	return v, ok
+}
+`
+	goPath := filepath.Join(repo, "map.go")
+	_ = os.WriteFile(goPath, []byte(goSrc), 0o644)
+	syms, _, err := extractFileSymbols(goPath, "map.go", []byte(goSrc))
+	if err != nil {
+		t.Fatalf("extractFileSymbols go: %v", err)
+	}
+	flat := flattenSymbols(syms)
+	foundLookup, foundVar, foundField := false, false, false
+	for _, s := range flat {
+		if s.NamePath == "Map/Lookup" {
+			foundLookup = true
+		}
+		if s.Name == "GlobalFlag" && s.Kind == "var" {
+			foundVar = true
+		}
+		if s.Name == "Items" && s.Kind == "field" {
+			foundField = true
+		}
+		if s.Name == "Version" && !strings.HasPrefix(string([]byte(goSrc)[s.StartByte:s.EndByte]), "const ") {
+			t.Fatalf("const Version span missing leading 'const ': %q", string([]byte(goSrc)[s.StartByte:s.EndByte]))
+		}
+	}
+	if !foundLookup || !foundVar || !foundField {
+		t.Fatalf("missing Go AST symbols: lookup=%v var=%v field=%v; flat=%+v", foundLookup, foundVar, foundField, flat)
+	}
+
+	// Strict mutation safety: fuzzy substring "Look" must NOT silently match "Map/Lookup"!
+	if _, _, _, _, err := resolveSingleSymbolInFile(repo, "map.go", "Look"); err == nil || !strings.Contains(err.Error(), "Map/Lookup") {
+		t.Fatalf("expected exact-match failure with closest hint, got err=%v", err)
+	}
+
+	// UTF-16 <-> UTF-8 offset accuracy on Thai + emoji line
+	line := []byte(`const msg = "สวัสดี🚀"; const target = 1;`)
+	idxTarget := bytes.Index(line, []byte("target"))
+	u16 := byteColToLSPCol(line, idxTarget, "utf-16")
+	back := lspColToByteCol(line, u16, "utf-16")
+	if back != idxTarget {
+		t.Fatalf("UTF-16 round-trip mismatch: byte=%d -> utf16=%d -> byte=%d", idxTarget, u16, back)
+	}
+
+	// Slim profile reduces tool count significantly vs full profile
+	fullTools := nativeToolCatalog("full")
+	slimTools := nativeToolCatalog("slim")
+	if len(slimTools) >= len(fullTools) || len(slimTools) < 10 {
+		t.Fatalf("unexpected tool profile counts: full=%d slim=%d", len(fullTools), len(slimTools))
+	}
+
+	// Hook apply_patch path extraction
+	patchPayload := []byte(`{"cwd":"/repo","tool_input":{"patch":"*** Begin Patch\n*** Update File: src/auth.ts\n@@\n*** Add File: src/new.go\n*** End Patch"}}`)
+	gotPaths := extractPathsFromHookPayload(patchPayload, "/repo")
+	if len(gotPaths) != 2 || gotPaths[0] != "/repo/src/auth.ts" || gotPaths[1] != "/repo/src/new.go" {
+		t.Fatalf("unexpected apply_patch paths: %v", gotPaths)
 	}
 }

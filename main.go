@@ -37,6 +37,7 @@ type parsedConfig struct {
 	passthrough bool
 	project     string
 	contextName string
+	profile     string
 	modes       []string
 	addModes    []string
 	backend     string
@@ -172,6 +173,10 @@ func parseStartArgs(args []string, cwd string) parsedConfig {
 		case "--context":
 			if v, ok := nextVal(); ok && v != "" {
 				cfg.contextName = v
+			}
+		case "--profile":
+			if v, ok := nextVal(); ok && v != "" {
+				cfg.profile = v
 			}
 		case "--mode":
 			if v, ok := nextVal(); ok && v != "" {
@@ -1224,6 +1229,10 @@ func main() {
 			os.Exit(runStatus())
 		case "stop-lsp":
 			os.Exit(runStopLSP())
+		case "hook":
+			os.Exit(runHookCLI(os.Args[2:]))
+		case "index":
+			os.Exit(runIndexCLI(os.Args[2:]))
 		}
 	}
 	if len(os.Args) < 2 {

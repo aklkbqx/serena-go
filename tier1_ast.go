@@ -5,11 +5,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	gts "github.com/odvcencio/gotreesitter"
@@ -43,7 +47,7 @@ type astSymbol struct {
 	StartByte uint32
 	EndByte   uint32
 	NameLine  int // 1-based line of identifier token (for LSP)
-	NameCol   int // 0-based col of identifier token (for LSP)
+	NameCol   int // 0-based UTF-8 byte col of identifier token (for LSP)
 	Signature string
 	Children  []astSymbol
 }
@@ -54,28 +58,128 @@ type syntaxDiag struct {
 	Message string
 }
 
+// Tiny mtime-keyed AST cache (capped at 32 files, 60s TTL) to avoid double parsing
+// within a turn while keeping multi-session Go heap footprint negligible.
+type cachedFileAST struct {
+	mtimeNS  int64
+	size     int64
+	cachedAt time.Time
+	syms     []astSymbol
+	diags    []syntaxDiag
+}
+
+var (
+	fileASTMu    sync.Mutex
+	fileASTCache = map[string]cachedFileAST{}
+)
+
+func purgeFileASTCache() {
+	fileASTMu.Lock()
+	fileASTCache = map[string]cachedFileAST{}
+	fileASTMu.Unlock()
+}
+
+func extractFileSymbolsCached(absPath, relPath string, src []byte) ([]astSymbol, []syntaxDiag, error) {
+	info, err := os.Stat(absPath)
+	if err == nil {
+		key := canonicalPath(absPath)
+		mtime := info.ModTime().UnixNano()
+		sz := info.Size()
+		fileASTMu.Lock()
+		if ent, ok := fileASTCache[key]; ok && ent.mtimeNS == mtime && ent.size == sz && time.Since(ent.cachedAt) < 60*time.Second {
+			fileASTMu.Unlock()
+			return ent.syms, ent.diags, nil
+		}
+		fileASTMu.Unlock()
+
+		syms, diags, perr := extractFileSymbols(absPath, relPath, src)
+		if perr != nil {
+			return nil, nil, perr
+		}
+		fileASTMu.Lock()
+		if len(fileASTCache) >= 32 {
+			// Evict oldest entry
+			oldestK := ""
+			var oldestT time.Time
+			for k, v := range fileASTCache {
+				if oldestK == "" || v.cachedAt.Before(oldestT) {
+					oldestK = k
+					oldestT = v.cachedAt
+				}
+			}
+			if oldestK != "" {
+				delete(fileASTCache, oldestK)
+			}
+		}
+		fileASTCache[key] = cachedFileAST{
+			mtimeNS:  mtime,
+			size:     sz,
+			cachedAt: time.Now(),
+			syms:     syms,
+			diags:    diags,
+		}
+		fileASTMu.Unlock()
+		return syms, diags, nil
+	}
+	return extractFileSymbols(absPath, relPath, src)
+}
+
 func firstLineTrimmed(s string) string {
 	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
 		s = s[:idx]
 	}
 	s = strings.TrimSpace(s)
 	if len(s) > 140 {
-		s = s[:137] + "..."
+		s = truncateUTF8(s, 137) + "..."
 	}
 	return s
+}
+
+// extractSignature collapses multiline declaration headers (up to opening body delimiter)
+// and skips leading Python @decorator lines so the AI sees the actual signature.
+func extractSignature(s string) string {
+	lines := strings.Split(s, "\n")
+	var parts []string
+	started := false
+	for _, raw := range lines {
+		ln := strings.TrimSpace(raw)
+		if ln == "" {
+			if started {
+				break
+			}
+			continue
+		}
+		// Skip leading Python/TS decorator lines if declaration follows
+		if !started && strings.HasPrefix(ln, "@") {
+			continue
+		}
+		started = true
+		parts = append(parts, ln)
+		if strings.HasSuffix(ln, "{") || strings.HasSuffix(ln, ":") || strings.Contains(ln, "=>") || strings.HasSuffix(ln, ";") || len(parts) >= 4 {
+			break
+		}
+	}
+	if len(parts) == 0 {
+		return firstLineTrimmed(s)
+	}
+	joined := strings.Join(parts, " ")
+	joined = strings.Join(strings.Fields(joined), " ")
+	if len(joined) > 160 {
+		joined = truncateUTF8(joined, 157) + "..."
+	}
+	return joined
 }
 
 func findIdentifierNode(bt *gts.BoundTree, n *gts.Node) *gts.Node {
 	if n == nil {
 		return nil
 	}
-	for _, field := range []string{"name", "declarator", "type"} {
+	for _, field := range []string{"name", "declarator", "type", "left"} {
 		if c := bt.ChildByField(n, field); c != nil {
 			ct := bt.NodeType(c)
 			if isIdentType(ct) {
 				return c
 			}
-			// Handle C/C++ function_declarator -> identifier, or Go type_spec -> name
 			if inner := findIdentifierNode(bt, c); inner != nil {
 				return inner
 			}
@@ -93,21 +197,77 @@ func findIdentifierNode(bt *gts.BoundTree, n *gts.Node) *gts.Node {
 func isIdentType(t string) bool {
 	switch t {
 	case "identifier", "type_identifier", "field_identifier", "property_identifier",
-		"simple_identifier", "constant", "word", "scoped_identifier":
+		"simple_identifier", "constant", "word", "scoped_identifier", "type_name":
 		return true
 	default:
 		return false
 	}
 }
 
-func classifyNode(bt *gts.BoundTree, n *gts.Node, src []byte) (kind string, kindNum int, nameNode *gts.Node, container bool) {
+func isUpperConstantName(name string) bool {
+	if len(name) < 2 {
+		return false
+	}
+	hasAlpha := false
+	for _, r := range name {
+		if r >= 'A' && r <= 'Z' {
+			hasAlpha = true
+		} else if (r >= '0' && r <= '9') || r == '_' {
+			continue
+		} else {
+			return false
+		}
+	}
+	return hasAlpha
+}
+
+func classifySwiftDecl(bt *gts.BoundTree, n *gts.Node) (string, int) {
+	head := firstLineTrimmed(bt.NodeText(n))
+	for _, kw := range strings.Fields(head) {
+		switch kw {
+		case "struct":
+			return "struct", symKindStruct
+		case "enum":
+			return "enum", symKindEnum
+		case "protocol":
+			return "interface", symKindInterface
+		case "actor", "class", "extension":
+			return "class", symKindClass
+		}
+	}
+	return "class", symKindClass
+}
+
+func cleanRustImplType(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if idx := strings.IndexByte(raw, '<'); idx >= 0 {
+		raw = raw[:idx]
+	}
+	if idx := strings.LastIndex(raw, "::"); idx >= 0 {
+		raw = raw[idx+2:]
+	}
+	return strings.TrimSpace(raw)
+}
+
+func classifyNode(bt *gts.BoundTree, n *gts.Node, src []byte, inContainer bool) (kind string, kindNum int, nameNode *gts.Node, container bool) {
 	t := bt.NodeType(n)
 	switch t {
 	case "function_declaration", "function_definition", "function_item", "generator_function_declaration":
+		if inContainer && (t == "function_definition" || t == "function_item" || t == "function_declaration") {
+			return "method", symKindMethod, findIdentifierNode(bt, n), false
+		}
 		return "function", symKindFunction, findIdentifierNode(bt, n), false
-	case "method_declaration", "method_definition", "method_elem":
+	case "method_declaration", "method_definition", "method_elem", "method_signature",
+		"abstract_method_signature", "function_signature_item", "method_spec":
 		return "method", symKindMethod, findIdentifierNode(bt, n), false
-	case "class_declaration", "class_definition", "class_specifier":
+	case "class_declaration":
+		// tree-sitter-swift reuses class_declaration for struct/enum/protocol/extension
+		if bt.ChildByField(n, "declaration_kind") != nil || strings.Contains(firstLineTrimmed(bt.NodeText(n)), "struct ") || strings.Contains(firstLineTrimmed(bt.NodeText(n)), "enum ") {
+			k, kn := classifySwiftDecl(bt, n)
+			return k, kn, findIdentifierNode(bt, n), true
+		}
+		return "class", symKindClass, findIdentifierNode(bt, n), true
+	case "abstract_class_declaration", "class_definition", "class_specifier":
 		return "class", symKindClass, findIdentifierNode(bt, n), true
 	case "interface_declaration", "protocol_declaration", "trait_item":
 		return "interface", symKindInterface, findIdentifierNode(bt, n), true
@@ -116,7 +276,6 @@ func classifyNode(bt *gts.BoundTree, n *gts.Node, src []byte) (kind string, kind
 	case "enum_declaration", "enum_item", "enum_specifier":
 		return "enum", symKindEnum, findIdentifierNode(bt, n), true
 	case "type_alias_declaration", "type_item", "type_spec":
-		// Go struct/interface inside type_spec
 		if typ := bt.ChildByField(n, "type"); typ != nil {
 			tt := bt.NodeType(typ)
 			if tt == "struct_type" {
@@ -128,17 +287,30 @@ func classifyNode(bt *gts.BoundTree, n *gts.Node, src []byte) (kind string, kind
 		}
 		return "type", symKindInterface, findIdentifierNode(bt, n), false
 	case "impl_item":
-		// Rust impl Foo { fn bar() }
 		if typ := bt.ChildByField(n, "type"); typ != nil {
 			return "impl", symKindClass, typ, true
 		}
 		return "impl", symKindClass, findIdentifierNode(bt, n), true
-	case "mod_item", "module", "namespace_definition":
+	case "mod_item", "module", "namespace_definition", "internal_module":
 		return "module", symKindModule, findIdentifierNode(bt, n), true
-	case "public_field_definition", "field_definition", "property_signature":
-		return "field", symKindField, findIdentifierNode(bt, n), false
+	case "public_field_definition", "field_definition", "property_signature", "field_declaration":
+		if inContainer {
+			return "field", symKindField, findIdentifierNode(bt, n), false
+		}
+	case "enum_assignment":
+		if inContainer {
+			return "const", symKindConstant, findIdentifierNode(bt, n), false
+		}
+	case "assignment":
+		// Python top-level UPPER_CASE constants (e.g. DEFAULT_TTL = 60)
+		if !inContainer {
+			if left := bt.ChildByField(n, "left"); left != nil && bt.NodeType(left) == "identifier" {
+				if isUpperConstantName(strings.TrimSpace(bt.NodeText(left))) {
+					return "const", symKindConstant, left, false
+				}
+			}
+		}
 	case "variable_declarator", "const_spec", "var_spec", "const_item", "static_item":
-		// Capture top-level constants and arrow/function variables (e.g. export const Foo = () => ...)
 		nm := findIdentifierNode(bt, n)
 		if nm == nil {
 			return "", 0, nil, false
@@ -152,7 +324,14 @@ func classifyNode(bt *gts.BoundTree, n *gts.Node, src []byte) (kind string, kind
 		if t == "const_spec" || t == "const_item" || t == "static_item" {
 			return "const", symKindConstant, nm, false
 		}
-		// Only record top-level variable_declarators (const/let/var at file scope)
+		if t == "var_spec" {
+			if p := n.Parent(); p != nil && bt.NodeType(p) == "var_declaration" {
+				if gp := p.Parent(); gp != nil && bt.NodeType(gp) == "source_file" {
+					return "var", symKindVariable, nm, false
+				}
+			}
+		}
+		// Top-level JS/TS variable_declarators
 		if p := n.Parent(); p != nil {
 			pt := bt.NodeType(p)
 			if pt == "lexical_declaration" || pt == "variable_declaration" {
@@ -169,7 +348,8 @@ func classifyNode(bt *gts.BoundTree, n *gts.Node, src []byte) (kind string, kind
 	return "", 0, nil, false
 }
 
-// goMethodReceiver extracts Go method receiver type name (e.g. "*Server" -> "Server").
+// goMethodReceiver extracts Go method receiver type name cleanly, including generic receivers
+// such as `func (m *Map[K, V]) Lookup(...)` -> "Map".
 func goMethodReceiver(bt *gts.BoundTree, n *gts.Node) string {
 	if bt.NodeType(n) != "method_declaration" {
 		return ""
@@ -179,27 +359,28 @@ func goMethodReceiver(bt *gts.BoundTree, n *gts.Node) string {
 		return ""
 	}
 	txt := bt.NodeText(recv)
-	// Strip parens, pointer, receiver var name, generic args
 	txt = strings.Trim(txt, "() \t\n")
+	// Strip generic parameter list `[K, V]` BEFORE splitting on whitespace!
+	if idx := strings.IndexByte(txt, '['); idx >= 0 {
+		txt = txt[:idx]
+	}
 	parts := strings.Fields(txt)
 	if len(parts) == 0 {
 		return ""
 	}
 	typ := parts[len(parts)-1]
 	typ = strings.TrimLeft(typ, "*")
-	if idx := strings.IndexByte(typ, '['); idx >= 0 {
-		typ = typ[:idx]
-	}
 	return strings.TrimSpace(typ)
 }
 
-// expandToOuterDeclaration widens start/end byte range to cover export_statement / lexical_declaration wrappers.
+// expandToOuterDeclaration widens start/end byte range to cover export_statement,
+// decorated_definition, and single-item type/const/var/lexical declarations.
 func expandToOuterDeclaration(bt *gts.BoundTree, n *gts.Node) *gts.Node {
 	cur := n
 	for p := cur.Parent(); p != nil; p = cur.Parent() {
 		pt := bt.NodeType(p)
-		if pt == "export_statement" || pt == "decorated_definition" ||
-			(pt == "type_declaration" && p.NamedChildCount() == 1) ||
+		if pt == "export_statement" || pt == "decorated_definition" || pt == "ambient_declaration" ||
+			((pt == "type_declaration" || pt == "const_declaration" || pt == "var_declaration") && p.NamedChildCount() == 1) ||
 			((pt == "lexical_declaration" || pt == "variable_declaration") && p.NamedChildCount() == 1) {
 			cur = p
 			continue
@@ -210,7 +391,7 @@ func expandToOuterDeclaration(bt *gts.BoundTree, n *gts.Node) *gts.Node {
 }
 
 func extractFileSymbols(absPath, relPath string, src []byte) ([]astSymbol, []syntaxDiag, error) {
-	bt, err := grammars.ParseFile(absPath, src)
+	bt, err := grammars.ParseFilePooled(absPath, src)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -221,18 +402,20 @@ func extractFileSymbols(absPath, relPath string, src []byte) ([]astSymbol, []syn
 		return nil, nil, nil
 	}
 
-	var syms []astSymbol
-	var walk func(n *gts.Node, prefix string, depth int) []astSymbol
-	walk = func(n *gts.Node, prefix string, depth int) []astSymbol {
+	var walk func(n *gts.Node, prefix string, depth int, inContainer bool) []astSymbol
+	walk = func(n *gts.Node, prefix string, depth int, inContainer bool) []astSymbol {
 		if n == nil || depth > 8 {
 			return nil
 		}
 		var out []astSymbol
 		for i := 0; i < n.NamedChildCount(); i++ {
 			c := n.NamedChild(i)
-			kind, kindNum, nameNode, isContainer := classifyNode(bt, c, src)
+			kind, kindNum, nameNode, isContainer := classifyNode(bt, c, src, inContainer)
 			if kind != "" && nameNode != nil {
 				name := strings.TrimSpace(bt.NodeText(nameNode))
+				if kind == "impl" {
+					name = cleanRustImplType(name)
+				}
 				if name == "" {
 					continue
 				}
@@ -267,26 +450,30 @@ func extractFileSymbols(absPath, relPath string, src []byte) ([]astSymbol, []syn
 					EndByte:   eb,
 					NameLine:  int(nameNode.StartPoint().Row) + 1,
 					NameCol:   int(nameNode.StartPoint().Column),
-					Signature: firstLineTrimmed(string(src[sb:eb])),
+					Signature: extractSignature(string(src[sb:eb])),
 				}
 				if isContainer {
-					sym.Children = walk(c, namePath, depth+1)
+					sym.Children = walk(c, namePath, depth+1, true)
 				}
 				out = append(out, sym)
 				continue
 			}
-			// Transparent wrappers (export_statement, type_declaration, class_body, block, etc.)
+			// Transparent wrappers (export_statement, type_declaration, struct_type, class_body, etc.)
 			ct := bt.NodeType(c)
 			switch ct {
-			case "export_statement", "decorated_definition", "lexical_declaration", "variable_declaration",
-				"type_declaration", "const_declaration", "var_declaration", "class_body", "declaration_list",
-				"interface_body", "object_type", "block", "suite", "statement_block":
-				out = append(out, walk(c, prefix, depth+1)...)
+			case "export_statement", "decorated_definition", "ambient_declaration",
+				"lexical_declaration", "variable_declaration",
+				"type_declaration", "const_declaration", "var_declaration",
+				"struct_type", "interface_type", "field_declaration_list",
+				"class_body", "declaration_list", "interface_body", "object_type",
+				"enum_body", "expression_statement", "statement_block",
+				"block", "suite", "protocol_body":
+				out = append(out, walk(c, prefix, depth+1, inContainer)...)
 			}
 		}
 		return out
 	}
-	syms = walk(root, "", 0)
+	syms := walk(root, "", 0, false)
 
 	// Collect syntax errors (capped at 10)
 	var diags []syntaxDiag
@@ -304,7 +491,7 @@ func extractFileSymbols(absPath, relPath string, src []byte) ([]astSymbol, []syn
 				} else {
 					snippet := firstLineTrimmed(bt.NodeText(n))
 					if len(snippet) > 50 {
-						snippet = snippet[:47] + "..."
+						snippet = truncateUTF8(snippet, 47) + "..."
 					}
 					if snippet != "" {
 						msg = fmt.Sprintf("syntax error near %q", snippet)
@@ -358,7 +545,11 @@ func matchSymbolPattern(sym astSymbol, pattern string, substr bool) bool {
 func formatSymbolTree(syms []astSymbol, maxDepth, curDepth int, b *strings.Builder) {
 	indent := strings.Repeat("  ", curDepth)
 	for _, s := range syms {
-		fmt.Fprintf(b, "%s[%s] %s (L%d-L%d) — %s\n", indent, s.Kind, s.NamePath, s.StartLine, s.EndLine, s.Signature)
+		sig := s.Signature
+		if len(sig) > 100 {
+			sig = truncateUTF8(sig, 97) + "..."
+		}
+		fmt.Fprintf(b, "%s[%s] %s L%d-%d | %s\n", indent, s.Kind, s.NamePath, s.StartLine, s.EndLine, sig)
 		if curDepth < maxDepth && len(s.Children) > 0 {
 			formatSymbolTree(s.Children, maxDepth, curDepth+1, b)
 		}
@@ -379,7 +570,7 @@ func toolGetSymbolsOverview(repoRoot string, args map[string]any) (string, error
 	if depth < 0 {
 		depth = 0
 	}
-	syms, diags, err := extractFileSymbols(target, rel, src)
+	syms, diags, err := extractFileSymbolsCached(target, rel, src)
 	if err != nil {
 		return "", fmt.Errorf("AST parse %s: %w", rel, err)
 	}
@@ -395,7 +586,7 @@ func toolGetSymbolsOverview(repoRoot string, args map[string]any) (string, error
 	return truncateAnswer(strings.TrimSpace(b.String()), argInt(args, "max_answer_chars", defaultMaxAnswerChars)), nil
 }
 
-func candidateFilesForSymbol(repoRoot, relScope, pattern string) ([]string, error) {
+func candidateFilesForSymbol(repoRoot, relScope, pattern string, caseInsensitive bool) ([]string, error) {
 	target, err := resolveRepoPath(repoRoot, relScope)
 	if err != nil {
 		return nil, err
@@ -407,7 +598,6 @@ func candidateFilesForSymbol(repoRoot, relScope, pattern string) ([]string, erro
 	if !info.IsDir() {
 		return []string{target}, nil
 	}
-	// Extract leaf name for ripgrep prefilter
 	leaf := strings.TrimPrefix(strings.TrimSpace(pattern), "/")
 	if idx := strings.LastIndexByte(leaf, '/'); idx >= 0 {
 		leaf = leaf[idx+1:]
@@ -415,8 +605,12 @@ func candidateFilesForSymbol(repoRoot, relScope, pattern string) ([]string, erro
 	rgBin := findRipgrep()
 	if rgBin != "" && leaf != "" {
 		args := []string{"-l", "-F", "--max-filesize", "1M",
-			"-g", "!.git/*", "-g", "!node_modules/*", "-g", "!graft/*", "-g", "!dist/*", "-g", "!.next/*", "-g", "!target/*", "-g", "!Pods/*",
-			"-e", leaf, target}
+			"-g", "!.git/*", "-g", "!node_modules/*", "-g", "!graft/*", "-g", "!dist/*", "-g", "!.next/*",
+			"-g", "!target/*", "-g", "!Pods/*", "-g", "!.superpowers/*", "-g", "!.worktrees/*"}
+		if caseInsensitive {
+			args = append(args, "-i")
+		}
+		args = append(args, "-e", leaf, target)
 		out, err := exec.Command(rgBin, args...).Output()
 		if err == nil {
 			var files []string
@@ -426,26 +620,28 @@ func candidateFilesForSymbol(repoRoot, relScope, pattern string) ([]string, erro
 				}
 			}
 			sort.Strings(files)
-			if len(files) > 80 {
-				files = files[:80]
+			if len(files) > 160 {
+				files = files[:160]
 			}
 			return files, nil
 		}
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return nil, nil
+		}
 	}
-	// Fallback: walk up to 80 code files
+	// Fallback when rg is unavailable or pattern is empty: walk up to 160 code files.
 	var files []string
 	_ = filepath.WalkDir(target, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
-			switch d.Name() {
-			case ".git", "node_modules", "graft", "dist", ".next", "target", "Pods", "DerivedData", "build":
+			if shouldSkipIndexDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if len(files) >= 80 {
+		if len(files) >= 160 {
 			return filepath.SkipAll
 		}
 		if grammars.DetectLanguage(p) != nil {
@@ -460,36 +656,98 @@ func findSymbolsAcrossRepo(repoRoot, relScope, pattern string, substr bool, incK
 	if maxMatches <= 0 {
 		maxMatches = 20
 	}
-	files, err := candidateFilesForSymbol(repoRoot, relScope, pattern)
+	// Fast-path: use pre-built V2 mmap symbol index when querying directory scope with warm cache.
+	if relScope == "" || relScope == "." {
+		if idxHits, ok := lookupSymbolsInMmapIndex(repoRoot, pattern, substr, incKinds, excKinds, maxMatches); ok {
+			sources := make(map[string][]byte, len(idxHits))
+			for _, s := range idxHits {
+				if _, loaded := sources[s.RelPath]; !loaded {
+					if raw, rerr := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(s.RelPath))); rerr == nil {
+						sources[s.RelPath] = raw
+					}
+				}
+			}
+			return idxHits, sources, nil
+		}
+	}
+
+	files, err := candidateFilesForSymbol(repoRoot, relScope, pattern, substr)
 	if err != nil {
 		return nil, nil, err
 	}
+	if len(files) == 0 {
+		return nil, map[string][]byte{}, nil
+	}
+
+	workers := runtime.NumCPU()
+	if workers > 6 {
+		workers = 6
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if len(files) < workers {
+		workers = len(files)
+	}
+
+	type fileResult struct {
+		idx     int
+		rel     string
+		src     []byte
+		matches []astSymbol
+	}
+	jobs := make(chan int, len(files))
+	for i := range files {
+		jobs <- i
+	}
+	close(jobs)
+
+	results := make([]fileResult, len(files))
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				f := files[idx]
+				src, rerr := os.ReadFile(f)
+				if rerr != nil || len(src) > 1024*1024 {
+					continue
+				}
+				rel, _ := filepath.Rel(repoRoot, f)
+				rel = filepath.ToSlash(rel)
+				syms, _, perr := extractFileSymbolsCached(f, rel, src)
+				if perr != nil {
+					continue
+				}
+				var local []astSymbol
+				for _, s := range flattenSymbols(syms) {
+					if len(incKinds) > 0 && !incKinds[s.KindNum] {
+						continue
+					}
+					if len(excKinds) > 0 && excKinds[s.KindNum] {
+						continue
+					}
+					if matchSymbolPattern(s, pattern, substr) {
+						local = append(local, s)
+					}
+				}
+				if len(local) > 0 {
+					results[idx] = fileResult{idx: idx, rel: rel, src: src, matches: local}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
 	var matches []astSymbol
 	sources := make(map[string][]byte)
-	for _, f := range files {
-		src, err := os.ReadFile(f)
-		if err != nil || len(src) > 1024*1024 {
-			continue
-		}
-		rel, _ := filepath.Rel(repoRoot, f)
-		rel = filepath.ToSlash(rel)
-		syms, _, err := extractFileSymbols(f, rel, src)
-		if err != nil {
-			continue
-		}
-		for _, s := range flattenSymbols(syms) {
-			if len(incKinds) > 0 && !incKinds[s.KindNum] {
-				continue
-			}
-			if len(excKinds) > 0 && excKinds[s.KindNum] {
-				continue
-			}
-			if matchSymbolPattern(s, pattern, substr) {
-				matches = append(matches, s)
-				sources[rel] = src
-				if len(matches) >= maxMatches {
-					return matches, sources, nil
-				}
+	for _, r := range results {
+		for _, m := range r.matches {
+			matches = append(matches, m)
+			sources[r.rel] = r.src
+			if len(matches) >= maxMatches {
+				return matches, sources, nil
 			}
 		}
 	}
@@ -504,6 +762,7 @@ func toolFindSymbol(repoRoot string, args map[string]any) (string, error) {
 	relScope := argString(args, "relative_path")
 	substr := argBool(args, "substring_matching", false)
 	incBody := argBool(args, "include_body", false)
+	incInfo := argBool(args, "include_info", false)
 	depth := argInt(args, "depth", 0)
 	maxMatches := argInt(args, "max_matches", 20)
 	incKinds := argIntSet(args, "include_kinds")
@@ -513,16 +772,17 @@ func toolFindSymbol(repoRoot string, args map[string]any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if len(matches) == 0 && !substr {
-		// Helpful automatic fallback hint: try substring match if exact failed
-		matches, sources, _ = findSymbolsAcrossRepo(repoRoot, relScope, pat, true, incKinds, excKinds, 5)
-		if len(matches) > 0 {
-			var b strings.Builder
-			fmt.Fprintf(&b, "No exact match for %q. Closest symbols:\n", pat)
-			for _, m := range matches {
-				fmt.Fprintf(&b, "- [%s] %s in %s (L%d-L%d)\n", m.Kind, m.NamePath, m.RelPath, m.StartLine, m.EndLine)
+	if len(matches) == 0 {
+		if !substr {
+			hintMatches, _, _ := findSymbolsAcrossRepo(repoRoot, relScope, pat, true, incKinds, excKinds, 5)
+			if len(hintMatches) > 0 {
+				var b strings.Builder
+				fmt.Fprintf(&b, "No exact match for %q. Closest symbols:\n", pat)
+				for _, m := range hintMatches {
+					fmt.Fprintf(&b, "- [%s] %s in %s (L%d-L%d)\n", m.Kind, m.NamePath, m.RelPath, m.StartLine, m.EndLine)
+				}
+				return b.String(), nil
 			}
-			return b.String(), nil
 		}
 		return fmt.Sprintf("No symbol matching %q found.", pat), nil
 	}
@@ -533,6 +793,14 @@ func toolFindSymbol(repoRoot string, args map[string]any) (string, error) {
 			b.WriteByte('\n')
 		}
 		fmt.Fprintf(&b, "[%s] %s — %s:L%d-L%d\n", m.Kind, m.NamePath, m.RelPath, m.StartLine, m.EndLine)
+		if incInfo {
+			absFile := filepath.Join(repoRoot, filepath.FromSlash(m.RelPath))
+			if lang := detectLSPLang(absFile); lang != "" {
+				if hover := queryWarmLSPHover(repoRoot, lang, absFile, m.NameLine-1, m.NameCol); hover != "" {
+					fmt.Fprintf(&b, "  hover: %s\n", firstLineTrimmed(hover))
+				}
+			}
+		}
 		if depth > 0 && len(m.Children) > 0 {
 			formatSymbolTree(m.Children, depth, 1, &b)
 		}
@@ -552,6 +820,8 @@ func toolFindSymbol(repoRoot string, args map[string]any) (string, error) {
 	return truncateAnswer(strings.TrimSpace(b.String()), argInt(args, "max_answer_chars", defaultMaxAnswerChars)), nil
 }
 
+// resolveSingleSymbolInFile requires an exact symbol match for safety on mutating operations.
+// When exact matching fails, it reports closest substring candidates in the error message.
 func resolveSingleSymbolInFile(repoRoot, rel, namePath string) (astSymbol, string, []byte, os.FileMode, error) {
 	target, err := resolveRepoPath(repoRoot, rel)
 	if err != nil {
@@ -565,25 +835,30 @@ func resolveSingleSymbolInFile(repoRoot, rel, namePath string) (astSymbol, strin
 	if err != nil {
 		return astSymbol{}, "", nil, 0, err
 	}
-	syms, _, err := extractFileSymbols(target, rel, src)
+	syms, _, err := extractFileSymbolsCached(target, rel, src)
 	if err != nil {
 		return astSymbol{}, "", nil, 0, err
 	}
+	flat := flattenSymbols(syms)
 	var hits []astSymbol
-	for _, s := range flattenSymbols(syms) {
+	for _, s := range flat {
 		if matchSymbolPattern(s, namePath, false) {
 			hits = append(hits, s)
 		}
 	}
 	if len(hits) == 0 {
-		// Try fuzzy substring match if unambiguous
-		for _, s := range flattenSymbols(syms) {
+		var hints []string
+		for _, s := range flat {
 			if matchSymbolPattern(s, namePath, true) {
-				hits = append(hits, s)
+				hints = append(hints, fmt.Sprintf("%s (L%d)", s.NamePath, s.StartLine))
+				if len(hints) >= 5 {
+					break
+				}
 			}
 		}
-	}
-	if len(hits) == 0 {
+		if len(hints) > 0 {
+			return astSymbol{}, "", nil, 0, fmt.Errorf("exact symbol %q not found in %s (closest: %s)", namePath, rel, strings.Join(hints, ", "))
+		}
 		return astSymbol{}, "", nil, 0, fmt.Errorf("symbol %q not found in %s", namePath, rel)
 	}
 	if len(hits) > 1 {
@@ -600,6 +875,16 @@ func toolReplaceSymbolBody(repoRoot string, args map[string]any) (string, error)
 	rel := argString(args, "relative_path")
 	np := argString(args, "name_path")
 	body := argString(args, "body")
+	if rel == "" || np == "" {
+		return "", errors.New("relative_path and name_path are required")
+	}
+	targetPath, err := resolveRepoPath(repoRoot, rel)
+	if err != nil {
+		return "", err
+	}
+	unlock := lockFileWrite(targetPath)
+	defer unlock()
+
 	sym, target, src, perm, err := resolveSingleSymbolInFile(repoRoot, rel, np)
 	if err != nil {
 		return "", err
@@ -607,13 +892,17 @@ func toolReplaceSymbolBody(repoRoot string, args map[string]any) (string, error)
 	var out bytes.Buffer
 	out.Write(src[:sym.StartByte])
 	out.WriteString(body)
+	if len(body) > 0 && body[len(body)-1] != '\n' && int(sym.EndByte) < len(src) && src[sym.EndByte] != '\n' {
+		out.WriteByte('\n')
+	}
 	out.Write(src[sym.EndByte:])
-	if err := atomicWriteFile(target, out.Bytes(), perm); err != nil {
+	newBytes := out.Bytes()
+	if err := atomicWriteFile(target, newBytes, perm); err != nil {
 		return "", err
 	}
-	msg := fmt.Sprintf("Replaced symbol %s in %s (was L%d-L%d).", sym.NamePath, rel, sym.StartLine, sym.EndLine)
-	if diag := checkSyntaxQuick(target, out.Bytes()); diag != "" {
-		msg += "\n[Syntax Warning]\n" + diag
+	msg := fmt.Sprintf("Replaced %s in %s (was L%d-L%d).", sym.NamePath, rel, sym.StartLine, sym.EndLine)
+	if diag := checkFileQuick(target); diag != "" {
+		msg += "\n[Diagnostics]\n" + diag
 	}
 	return msg, nil
 }
@@ -622,45 +911,85 @@ func toolInsertRelativeToSymbol(repoRoot string, args map[string]any, after bool
 	rel := argString(args, "relative_path")
 	np := argString(args, "name_path")
 	body := argString(args, "body")
+	if rel == "" || np == "" {
+		return "", errors.New("relative_path and name_path are required")
+	}
+	targetPath, err := resolveRepoPath(repoRoot, rel)
+	if err != nil {
+		return "", err
+	}
+	unlock := lockFileWrite(targetPath)
+	defer unlock()
+
 	sym, target, src, perm, err := resolveSingleSymbolInFile(repoRoot, rel, np)
 	if err != nil {
 		return "", err
 	}
 	var out bytes.Buffer
-	if after {
-		out.Write(src[:sym.EndByte])
-		if !strings.HasPrefix(body, "\n") {
-			out.WriteByte('\n')
-		}
-		out.WriteString(body)
-		out.Write(src[sym.EndByte:])
-	} else {
+	if !after {
 		out.Write(src[:sym.StartByte])
 		out.WriteString(body)
 		if !strings.HasSuffix(body, "\n") {
 			out.WriteByte('\n')
 		}
 		out.Write(src[sym.StartByte:])
+	} else {
+		out.Write(src[:sym.EndByte])
+		if sym.EndByte > 0 && src[sym.EndByte-1] != '\n' {
+			out.WriteByte('\n')
+		}
+		if !strings.HasPrefix(body, "\n") {
+			out.WriteByte('\n')
+		}
+		out.WriteString(body)
+		if !strings.HasSuffix(body, "\n") {
+			out.WriteByte('\n')
+		}
+		out.Write(src[sym.EndByte:])
 	}
-	if err := atomicWriteFile(target, out.Bytes(), perm); err != nil {
+	newBytes := out.Bytes()
+	if err := atomicWriteFile(target, newBytes, perm); err != nil {
 		return "", err
 	}
-	pos := "before"
+	dirWord := "before"
 	if after {
-		pos = "after"
+		dirWord = "after"
 	}
-	msg := fmt.Sprintf("Inserted code %s symbol %s in %s.", pos, sym.NamePath, rel)
-	if diag := checkSyntaxQuick(target, out.Bytes()); diag != "" {
-		msg += "\n[Syntax Warning]\n" + diag
+	msg := fmt.Sprintf("Inserted code %s %s in %s.", dirWord, sym.NamePath, rel)
+	if diag := checkFileQuick(target); diag != "" {
+		msg += "\n[Diagnostics]\n" + diag
 	}
 	return msg, nil
 }
 
-func checkSyntaxQuick(absPath string, src []byte) string {
-	if grammars.DetectLanguage(absPath) == nil {
+func checkGoSyntaxStdlib(absPath string, src []byte) string {
+	fset := token.NewFileSet()
+	_, err := parser.ParseFile(fset, absPath, src, parser.SkipObjectResolution)
+	if err == nil {
 		return ""
 	}
-	_, diags, err := extractFileSymbols(absPath, filepath.Base(absPath), src)
+	base := filepath.Base(absPath)
+	rawLines := strings.Split(strings.TrimSpace(err.Error()), "\n")
+	var out []string
+	for _, ln := range rawLines {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		ln = strings.ReplaceAll(ln, absPath, base)
+		out = append(out, "[syntax] "+ln)
+		if len(out) >= 5 {
+			break
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+func checkSyntaxQuick(absPath string, src []byte) string {
+	if strings.EqualFold(filepath.Ext(absPath), ".go") {
+		return checkGoSyntaxStdlib(absPath, src)
+	}
+	_, diags, err := extractFileSymbolsCached(absPath, filepath.Base(absPath), src)
 	if err != nil || len(diags) == 0 {
 		return ""
 	}
@@ -674,29 +1003,20 @@ func checkSyntaxQuick(absPath string, src []byte) string {
 	return strings.TrimSpace(b.String())
 }
 
-// checkFileQuick powers `serena check-file <path>` (PostToolUse hook) and code_context_pack diagnostics.
-// Runs <10ms AST syntax + <50ms oxlint/ty + optional warm-only LSP diagnostics (NEVER cold-boots LSP).
-func checkFileQuick(absPath string) string {
-	src, err := os.ReadFile(absPath)
-	if err != nil {
-		return ""
-	}
-	var lines []string
-	if syn := checkSyntaxQuick(absPath, src); syn != "" {
-		lines = append(lines, strings.Split(syn, "\n")...)
-	}
-
+// runFastLinters invokes external fast correctness linters (oxlint for TS/JS, ty for Python).
+func runFastLinters(absPath string) (lines []string, ran bool) {
 	ext := strings.ToLower(filepath.Ext(absPath))
+	home, _ := os.UserHomeDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
 	defer cancel()
 
-	home, _ := os.UserHomeDir()
 	switch ext {
-	case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs":
+	case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts":
 		if ox := findToolBin("oxlint",
 			filepath.Join(home, ".bun/bin/oxlint"),
 			filepath.Join(home, ".local/bin/oxlint"),
 		); ox != "" {
+			ran = true
 			cmd := exec.CommandContext(ctx, ox, "--format", "unix", "-D", "correctness", "--quiet", absPath)
 			out, _ := cmd.Output()
 			for _, ln := range strings.Split(strings.TrimSpace(string(out)), "\n") {
@@ -708,6 +1028,7 @@ func checkFileQuick(absPath string) string {
 		}
 	case ".py":
 		if tyBin := findToolBin("ty", filepath.Join(home, ".local/bin/ty")); tyBin != "" {
+			ran = true
 			cmd := exec.CommandContext(ctx, tyBin, "check", "--output-format", "concise", absPath)
 			out, _ := cmd.Output()
 			for _, ln := range strings.Split(strings.TrimSpace(string(out)), "\n") {
@@ -718,20 +1039,65 @@ func checkFileQuick(absPath string) string {
 			}
 		}
 	}
+	return lines, ran
+}
 
-	// Query warm LSP diagnostics if an LSP daemon is ALREADY running (0 cold-start cost!).
-	if repoRoot := findGitRoot(filepath.Dir(absPath)); repoRoot != "" {
-		if lang := detectLSPLang(absPath); lang != "" {
-			if warmDiags := queryWarmLSPDiagnostics(repoRoot, lang, absPath); len(warmDiags) > 0 {
-				lines = append(lines, warmDiags...)
+// checkFileQuick powers `serena check-file <path>`, Serena edit tools, and code_context_pack.
+// Runs checks in parallel: Go stdlib go/parser (<1ms), TS oxlint without redundant tree-sitter
+// decompression (~50ms), Python ty, plus warm-only LSP diagnostics (NEVER cold-boots LSP).
+func checkFileQuick(absPath string) string {
+	src, err := os.ReadFile(absPath)
+	if err != nil {
+		return ""
+	}
+	ext := strings.ToLower(filepath.Ext(absPath))
+	isTS := ext == ".ts" || ext == ".tsx" || ext == ".js" || ext == ".jsx" || ext == ".mjs" || ext == ".cjs" || ext == ".mts" || ext == ".cts"
+
+	var (
+		synLines  []string
+		lintLines []string
+		lintRan   bool
+		lspLines  []string
+		wg        sync.WaitGroup
+	)
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		lintLines, lintRan = runFastLinters(absPath)
+	}()
+	go func() {
+		defer wg.Done()
+		if repoRoot := findGitRoot(filepath.Dir(absPath)); repoRoot != "" {
+			if lang := detectLSPLang(absPath); lang != "" {
+				lspLines = queryWarmLSPDiagnostics(repoRoot, lang, absPath)
 			}
+		}
+	}()
+
+	// Run syntax check in parallel for non-TS files (Go uses <1ms stdlib go/parser).
+	if !isTS {
+		if syn := checkSyntaxQuick(absPath, src); syn != "" {
+			synLines = strings.Split(syn, "\n")
+		}
+	}
+	wg.Wait()
+
+	// For TS/JS, only fall back to tree-sitter syntax parse if oxlint is not installed.
+	if isTS && !lintRan {
+		if syn := checkSyntaxQuick(absPath, src); syn != "" {
+			synLines = strings.Split(syn, "\n")
 		}
 	}
 
-	// Deduplicate and cap at 5 diagnostics.
+	var all []string
+	all = append(all, synLines...)
+	all = append(all, lintLines...)
+	all = append(all, lspLines...)
+
 	seen := map[string]bool{}
 	var uniq []string
-	for _, l := range lines {
+	for _, l := range all {
 		if l == "" || seen[l] {
 			continue
 		}

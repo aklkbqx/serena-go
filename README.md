@@ -31,18 +31,19 @@ See [docs/architecture.md](docs/architecture.md) for full internals.
 
 ## Live Benchmarks
 
-Measured on Apple M4 (16 GB RAM) against real Go (8,299 AST chunks) and Go/TypeScript (12,226 AST chunks) repositories:
+Measured on Apple M4 (16 GB RAM) against real Go and Go/TypeScript repositories (`v0.2.0`, V2 shared `mmap` index + SQ8 GPU vectors):
 
 | Operation | Engine Tier | Latency | Local LSP RAM |
 |---|---|---|---|
-| `initialize` + `tools/list` | Native Go | `~8 ms` | `0 MB` |
 | `list_memories` | Tier 0 FS | `1.9 ms` | `0 MB` |
-| `get_symbols_overview` (47 symbols) | Tier 1 `gotreesitter` AST | `46.6 ms` | `0 MB` |
-| `code_context_pack` (body + imports + callers + diags) | Tier 1+ | `121.1 ms` | `0 MB` |
-| `semantic_code_search` (12,226 chunks, warm Hybrid GPU RRF) | Tier 1 + `nomic-embed-text` | `195.1 ms` | `0 MB` |
+| `find_symbol` (14,898 chunks via V2 `mmap`) | V2 `mmap` symbol table | **`0.3 ms`** | `0 MB` |
+| `semantic_code_search` (warm BM25, V2 `mmap`) | Tier 1 inverted index | **`5.9 ms`** | `0 MB` |
+| `semantic_code_search` (100% corpus GPU SQ8 RRF, `Qwen3-0.6B`) | Tier 1 + GPU embeddings | **`15.8 ms` (`100%` Recall@5 EN+TH)** | `0 MB` |
+| `code_context_pack` (types + callers + callees + hover + diags) | Tier 1+ parallel | **`51.2 ms`** | `0 MB` |
 | `find_referencing_symbols` (remote `gopls`, warm) | Tier 2 Remote LSP | `31.7 ms` | `0 MB` |
-| `serena-go check-file` (AST + `oxlint` on broken TS) | Post-edit hook | `116.0 ms` | `0 MB` |
-| 18 concurrent MCP sessions | Native Go | — | **~33 MB total** |
+| `serena-go check-file` (Go `go/parser` / TS `oxlint`) | Post-edit hook | **`7.0 ms` / `84.9 ms`** | `0 MB` |
+| `serena-go hook post-edit` (clean Go, zero-`jq`) | Go CLI hook | **`6.2 ms`** | `0 MB` |
+| 18–20 concurrent MCP sessions | Native Go + shared `mmap` | — | **~30–40 MB total** |
 
 ---
 
@@ -115,8 +116,10 @@ args = ["start-mcp-server"]
 
 | Command | Purpose |
 |---|---|
-| `serena-go start-mcp-server [--project <dir>]` | Start stdio MCP server |
-| `serena-go check-file <path>` | Instant `<120 ms` AST + `oxlint`/`ty` + warm-LSP diagnostics (ideal for `PostToolUse` hooks; 0 output when clean) |
+| `serena-go start-mcp-server [--project <dir>] [--profile full\|slim]` | Start stdio MCP server (`slim` exposes 15 high-leverage tools for eager clients) |
+| `serena-go index [--embed] [repo]` | Build V2 shared `mmap` AST index (+ optional 100% corpus GPU SQ8 vectors) |
+| `serena-go check-file <path>` | Instant `<2 ms` Go / `~50 ms` TS diagnostics (0 output when clean) |
+| `serena-go hook <post-edit\|session-brief\|remind> [--client=...]` | Zero-`jq` `<6 ms` hooks for Claude Code, Antigravity, Codex (`apply_patch`), and Grok |
 | `serena-go doctor` | Check AST engine, local LSPs, remote offload, embeddings, and OS memory pressure policy |
 | `serena-go status` | List active shared LSP daemons (PID, host, idle age, repo) |
 | `serena-go stop-lsp` | Gracefully shut down all active shared LSP daemons |
@@ -124,12 +127,12 @@ args = ["start-mcp-server"]
 
 ---
 
-## MCP Tool Reference (24 Tools)
+## MCP Tool Reference (25 Tools · `--profile slim` = 15 Tools)
 
 | Tier | Tools | Runtime Cost |
 |---|---|---|
 | **Tier 0 (Native FS / `rg`)** | `initial_instructions`, `onboarding`, `list_memories`, `read_memory`, `write_memory`, `edit_memory`, `delete_memory`, `rename_memory`, `search_for_pattern`, `replace_content`, `replace_in_files` | `0 MB`, `<3 ms` |
-| **Tier 1 (`gotreesitter` AST & Search)** | `code_context_pack`, `semantic_code_search`, `get_symbols_overview`, `find_symbol`, `replace_symbol_body`, `insert_before_symbol`, `insert_after_symbol` | `0 MB` idle, `<50 ms` |
+| **Tier 1 (`gotreesitter` AST, V2 `mmap` & Diff)** | `code_context_pack` (single & batch `symbols`), `semantic_code_search`, `changed_symbols`, `get_symbols_overview`, `find_symbol`, `replace_symbol_body`, `insert_before_symbol`, `insert_after_symbol` | `0 MB` idle, `<2–45 ms` |
 | **Tier 2 (Lazy Shared / Remote LSP)** | `find_referencing_symbols`, `find_declaration`, `find_implementations`, `rename_symbol`, `get_diagnostics_for_file`, `safe_delete_symbol` | Lazy per `(repo, lang)`, shared across agents, LRU + pressure governed |
 
 ---

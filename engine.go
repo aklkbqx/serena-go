@@ -6,7 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/odvcencio/gotreesitter/grammars"
 )
 
 func dispatchNativeTool(repoRoot, name string, args map[string]any) (string, error) {
@@ -35,11 +40,13 @@ func dispatchNativeTool(repoRoot, name string, args map[string]any) (string, err
 	case "replace_in_files":
 		return toolReplaceInFiles(repoRoot, args)
 
-	// Tier 1: Stateless Pure-Go gotreesitter AST + Hybrid Semantic Search (0 MB idle, <25ms)
+	// Tier 1: Stateless Pure-Go gotreesitter AST + Hybrid Semantic Search + Diff Symbols
 	case "semantic_code_search":
 		return toolSemanticCodeSearch(repoRoot, args)
 	case "code_context_pack":
 		return toolCodeContextPack(repoRoot, args)
+	case "changed_symbols":
+		return toolChangedSymbols(repoRoot, args)
 	case "get_symbols_overview":
 		return toolGetSymbolsOverview(repoRoot, args)
 	case "find_symbol":
@@ -76,7 +83,40 @@ func runNativeMCP(cfg parsedConfig) int {
 		cwd, _ := os.Getwd()
 		repoRoot = canonicalPath(cwd)
 	}
-	tools := nativeToolCatalog()
+	profile := strings.TrimSpace(cfg.profile)
+	if profile == "" {
+		profile = strings.TrimSpace(os.Getenv("SERENA_PROFILE"))
+	}
+	tools := nativeToolCatalog(profile)
+
+	// Lock-free gotreesitter hot path: purge decompressed grammar tables only when idle.
+	var lastCallUnix atomic.Int64
+	lastCallUnix.Store(time.Now().Unix())
+	stopIdle := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(45 * time.Second)
+		defer ticker.Stop()
+		purgedAt := int64(0)
+		for {
+			select {
+			case <-stopIdle:
+				return
+			case <-ticker.C:
+				last := lastCallUnix.Load()
+				idleDur := time.Since(time.Unix(last, 0))
+				threshold := 120 * time.Second
+				if memoryPressureLevel() >= 2 {
+					threshold = 30 * time.Second
+				}
+				if idleDur >= threshold && purgedAt != last {
+					grammars.PurgeEmbeddedLanguageCache()
+					purgeFileASTCache()
+					purgedAt = last
+				}
+			}
+		}
+	}()
+	defer close(stopIdle)
 
 	reader := bufio.NewReaderSize(os.Stdin, 256*1024)
 	var stdoutMu sync.Mutex
@@ -93,6 +133,7 @@ func runNativeMCP(cfg parsedConfig) int {
 	}
 
 	handleReq := func(raw []byte) {
+		lastCallUnix.Store(time.Now().Unix())
 		var env rpcEnvelope
 		if json.Unmarshal(raw, &env) != nil {
 			return
@@ -120,7 +161,7 @@ func runNativeMCP(cfg parsedConfig) int {
 						"name":    "serena-go",
 						"version": buildVersion,
 					},
-					"instructions": "Serena Pure-Go 3-Tier Engine. Prefer code_context_pack and find_symbol/get_symbols_overview (0-RAM AST) before reading whole files.",
+					"instructions": "serena-go 3-Tier Engine. Use code_context_pack (supports batch symbols) for 1-shot definition+types+callers+callees+hover+diagnostics, semantic_code_search for intent queries, changed_symbols for git diff impact, and get_symbols_overview/find_symbol before reading full files.",
 				},
 			})
 		case "ping":

@@ -12,9 +12,33 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"unicode/utf8"
 )
 
 const defaultMaxAnswerChars = 16000
+
+var fileWriteLocks sync.Map // canonical absPath -> *sync.Mutex
+
+func lockFileWrite(absPath string) func() {
+	key := canonicalPath(absPath)
+	v, _ := fileWriteLocks.LoadOrStore(key, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// truncateUTF8 trims s to at most maxBytes without splitting multi-byte UTF-8 runes (e.g. Thai, emoji).
+func truncateUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
+		return s
+	}
+	i := maxBytes
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return s[:i]
+}
 
 func truncateAnswer(s string, maxChars int) string {
 	if maxChars <= 0 {
@@ -23,7 +47,7 @@ func truncateAnswer(s string, maxChars int) string {
 	if len(s) <= maxChars {
 		return s
 	}
-	return s[:maxChars] + fmt.Sprintf("\n... [truncated at %d chars; narrow relative_path or increase max_answer_chars]", maxChars)
+	return truncateUTF8(s, maxChars) + fmt.Sprintf("\n... [truncated at %d chars; narrow relative_path or increase max_answer_chars]", maxChars)
 }
 
 func evalSymlinksNearestAncestor(path string) string {
@@ -378,6 +402,8 @@ func toolReplaceContent(repoRoot string, args map[string]any) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	unlock := lockFileWrite(target)
+	defer unlock()
 	info, err := os.Stat(target)
 	if err != nil {
 		return "", err
@@ -394,8 +420,8 @@ func toolReplaceContent(repoRoot string, args map[string]any) (string, error) {
 		return "", err
 	}
 	msg := fmt.Sprintf("Replaced %d occurrence(s) in %s.", cnt, rel)
-	if diag := checkSyntaxQuick(target, []byte(updated)); diag != "" {
-		msg += "\n[Syntax Warning]\n" + diag
+	if diag := checkFileQuick(target); diag != "" {
+		msg += "\n[Diagnostics]\n" + diag
 	}
 	return msg, nil
 }
@@ -474,13 +500,42 @@ func toolReplaceInFiles(repoRoot string, args map[string]any) (string, error) {
 		return truncateAnswer(strings.TrimSpace(b.String()), argInt(args, "max_answer_chars", defaultMaxAnswerChars)), nil
 	}
 	for _, p := range plans {
-		if err := atomicWriteFile(p.path, []byte(p.updated), p.perm); err != nil {
-			return "", fmt.Errorf("write %s: %w", p.rel, err)
+		unlock := lockFileWrite(p.path)
+		werr := atomicWriteFile(p.path, []byte(p.updated), p.perm)
+		unlock()
+		if werr != nil {
+			return "", fmt.Errorf("write %s: %w", p.rel, werr)
 		}
 		fmt.Fprintf(&b, "- %s (%d)\n", p.rel, p.count)
 	}
 	header := fmt.Sprintf("Replaced %d occurrence(s) across %d file(s):\n", total, len(plans))
 	return truncateAnswer(strings.TrimSpace(header+b.String()), argInt(args, "max_answer_chars", defaultMaxAnswerChars)), nil
+}
+
+func argStringSlice(args map[string]any, key string) []string {
+	if args == nil {
+		return nil
+	}
+	v, ok := args[key]
+	if !ok || v == nil {
+		return nil
+	}
+	var out []string
+	switch arr := v.(type) {
+	case []any:
+		for _, item := range arr {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+	case []string:
+		for _, s := range arr {
+			if strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+	}
+	return out
 }
 
 func argString(args map[string]any, key string) string {

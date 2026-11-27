@@ -22,6 +22,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
 type lspLangSpec struct {
@@ -274,8 +276,10 @@ type lspProcessClient struct {
 	pendingMu sync.Mutex
 	pending   map[int64]chan json.RawMessage
 
-	openMu   sync.Mutex
-	openVers map[string]int
+	openMu     sync.Mutex
+	openVers   map[string]int
+	openHashes map[string][32]byte
+	posEnc     string // negotiated LSP positionEncoding: "utf-8" or "utf-16"
 
 	diagMu   sync.Mutex
 	diags    map[string][]lspDiagnostic
@@ -349,6 +353,8 @@ func startLSPProcess(repoRoot, remoteRoot, remoteHost string, spec *lspLangSpec,
 		lang:       spec.Lang,
 		pending:    map[int64]chan json.RawMessage{},
 		openVers:   map[string]int{},
+		openHashes: map[string][32]byte{},
+		posEnc:     "utf-16",
 		diags:      map[string][]lspDiagnostic{},
 		diagCond:   map[string][]chan struct{}{},
 	}
@@ -571,6 +577,9 @@ func (c *lspProcessClient) initialize(spec *lspLangSpec) error {
 			{"uri": rootURI, "name": filepath.Base(lspRoot)},
 		},
 		"capabilities": map[string]any{
+			"general": map[string]any{
+				"positionEncodings": []string{"utf-8", "utf-16"},
+			},
 			"textDocument": map[string]any{
 				"synchronization": map[string]any{"didSave": true},
 				"references":      map[string]any{"dynamicRegistration": false},
@@ -592,10 +601,105 @@ func (c *lspProcessClient) initialize(spec *lspLangSpec) error {
 	if len(spec.InitOptions) > 0 {
 		params["initializationOptions"] = spec.InitOptions
 	}
-	if _, err := c.call("initialize", params, 25*time.Second); err != nil {
+	initRes, err := c.call("initialize", params, 25*time.Second)
+	if err != nil {
 		return err
 	}
+	var initParsed struct {
+		Capabilities struct {
+			PositionEncoding string `json:"positionEncoding"`
+		} `json:"capabilities"`
+	}
+	if json.Unmarshal(initRes, &initParsed) == nil && strings.EqualFold(initParsed.Capabilities.PositionEncoding, "utf-8") {
+		c.posEnc = "utf-8"
+	} else {
+		c.posEnc = "utf-16"
+	}
 	return c.notify("initialized", map[string]any{})
+}
+
+func byteColToLSPCol(line []byte, byteCol int, enc string) int {
+	if byteCol < 0 {
+		return 0
+	}
+	if byteCol > len(line) {
+		byteCol = len(line)
+	}
+	if strings.EqualFold(enc, "utf-8") {
+		return byteCol
+	}
+	// Convert UTF-8 byte offset within line into UTF-16 code units.
+	units := 0
+	for i := 0; i < byteCol; {
+		r, size := utf8.DecodeRune(line[i:byteCol])
+		if r == utf8.RuneError && size <= 1 {
+			units++
+			i++
+			continue
+		}
+		if r >= 0x10000 {
+			units += 2
+		} else {
+			units++
+		}
+		i += size
+	}
+	return units
+}
+
+func lspColToByteCol(line []byte, lspCol int, enc string) int {
+	if lspCol <= 0 {
+		return 0
+	}
+	if strings.EqualFold(enc, "utf-8") {
+		if lspCol > len(line) {
+			return len(line)
+		}
+		return lspCol
+	}
+	units := 0
+	i := 0
+	for i < len(line) && units < lspCol {
+		r, size := utf8.DecodeRune(line[i:])
+		if r == utf8.RuneError && size <= 1 {
+			units++
+			i++
+			continue
+		}
+		step := 1
+		if len(utf16.Encode([]rune{r})) == 2 {
+			step = 2
+		}
+		if units+step > lspCol {
+			break
+		}
+		units += step
+		i += size
+	}
+	return i
+}
+
+func convertFileByteColToLSP(absPath string, line0, byteCol int, enc string) int {
+	if strings.EqualFold(enc, "utf-8") || byteCol <= 0 {
+		return byteCol
+	}
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return byteCol
+	}
+	cur := 0
+	start := 0
+	for start < len(data) && cur < line0 {
+		if data[start] == '\n' {
+			cur++
+		}
+		start++
+	}
+	end := start
+	for end < len(data) && data[end] != '\n' {
+		end++
+	}
+	return byteColToLSPCol(data[start:end], byteCol, enc)
 }
 
 func (c *lspProcessClient) syncFile(absPath string) (string, error) {
@@ -603,12 +707,20 @@ func (c *lspProcessClient) syncFile(absPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	sum := sha256.Sum256(data)
 	targetPath := mapLocalPathToRemote(absPath, c.root, c.remoteRoot)
 	uri := fileToURI(targetPath)
+
 	c.openMu.Lock()
 	ver, opened := c.openVers[uri]
+	prevHash := c.openHashes[uri]
+	if opened && prevHash == sum {
+		c.openMu.Unlock()
+		return uri, nil
+	}
 	ver++
 	c.openVers[uri] = ver
+	c.openHashes[uri] = sum
 	c.openMu.Unlock()
 
 	if !opened {
@@ -621,6 +733,10 @@ func (c *lspProcessClient) syncFile(absPath string) (string, error) {
 			},
 		})
 	} else {
+		// Invalidate stale publishDiagnostics cache whenever file bytes actually change.
+		c.diagMu.Lock()
+		delete(c.diags, uri)
+		c.diagMu.Unlock()
 		err = c.notify("textDocument/didChange", map[string]any{
 			"textDocument": map[string]any{"uri": uri, "version": ver},
 			"contentChanges": []map[string]any{
@@ -668,6 +784,7 @@ type lspIPCResp struct {
 	Edit        json.RawMessage `json:"edit,omitempty"`
 	Hover       string          `json:"hover,omitempty"`
 	Host        string          `json:"host,omitempty"`
+	PosEncoding string          `json:"pos_encoding,omitempty"`
 }
 
 func parseLocations(raw json.RawMessage) []lspLocation {
@@ -822,8 +939,8 @@ func runLSPSupervisor(args []string) int {
 					triggerStop()
 					return
 				}
-				if remoteHost != "" && idleLim < 300*time.Second {
-					idleLim = 300 * time.Second
+				if remoteHost != "" && idleLim < 1200*time.Second {
+					idleLim = 1200 * time.Second
 				}
 				actMu.Lock()
 				idleFor := time.Since(lastAct)
@@ -845,7 +962,7 @@ func runLSPSupervisor(args []string) int {
 			return
 		}
 		touchAct()
-		resp := lspIPCResp{OK: true, Host: hostLabel}
+		resp := lspIPCResp{OK: true, Host: hostLabel, PosEncoding: client.posEnc}
 		switch req.Action {
 		case "ping":
 		case "shutdown":
@@ -858,7 +975,8 @@ func runLSPSupervisor(args []string) int {
 				resp = lspIPCResp{OK: false, Error: err.Error(), Host: hostLabel}
 				break
 			}
-			pos := map[string]any{"line": req.Line, "character": req.Col}
+			lspCol := convertFileByteColToLSP(req.File, req.Line, req.Col, client.posEnc)
+			pos := map[string]any{"line": req.Line, "character": lspCol}
 			params := map[string]any{
 				"textDocument": map[string]any{"uri": uri},
 				"position":     pos,
@@ -879,9 +997,10 @@ func runLSPSupervisor(args []string) int {
 				resp = lspIPCResp{OK: false, Error: err.Error(), Host: hostLabel}
 				break
 			}
+			lspCol := convertFileByteColToLSP(req.File, req.Line, req.Col, client.posEnc)
 			params := map[string]any{
 				"textDocument": map[string]any{"uri": uri},
-				"position":     map[string]any{"line": req.Line, "character": req.Col},
+				"position":     map[string]any{"line": req.Line, "character": lspCol},
 				"newName":      req.NewName,
 			}
 			raw, err := client.call("textDocument/rename", params, 20*time.Second)
@@ -896,9 +1015,10 @@ func runLSPSupervisor(args []string) int {
 				resp = lspIPCResp{OK: false, Error: err.Error(), Host: hostLabel}
 				break
 			}
+			lspCol := convertFileByteColToLSP(req.File, req.Line, req.Col, client.posEnc)
 			raw, err := client.call("textDocument/hover", map[string]any{
 				"textDocument": map[string]any{"uri": uri},
-				"position":     map[string]any{"line": req.Line, "character": req.Col},
+				"position":     map[string]any{"line": req.Line, "character": lspCol},
 			}, 10*time.Second)
 			if err != nil {
 				resp = lspIPCResp{OK: false, Error: err.Error(), Host: hostLabel}
@@ -1187,7 +1307,7 @@ func formatLocations(repoRoot string, locs []lspLocation) []formattedRef {
 		if line-1 >= 0 && line-1 < len(lines) {
 			preview = strings.TrimSpace(lines[line-1])
 			if len(preview) > 110 {
-				preview = preview[:107] + "..."
+				preview = truncateUTF8(preview, 107) + "..."
 			}
 		}
 		out = append(out, formattedRef{RelPath: rel, Line: line, Col: col, Preview: preview})
@@ -1234,6 +1354,20 @@ func queryWarmLSPReferences(repoRoot, lang, absFile string, line0, col0 int) ([]
 		return nil, false
 	}
 	return formatLocations(repoRoot, resp.Locations), true
+}
+
+func queryWarmLSPHover(repoRoot, lang, absFile string, line0, col0 int) string {
+	resp, err := ensureAndQueryLSP(repoRoot, lang, lspIPCReq{
+		Action: "hover",
+		File:   absFile,
+		Line:   line0,
+		Col:    col0,
+		Fast:   true,
+	}, true)
+	if err != nil || resp == nil {
+		return ""
+	}
+	return strings.TrimSpace(resp.Hover)
 }
 
 // queryLSPWithFuzzing retries bounded identifier offsets if the initial LSP position returns empty.
@@ -1322,6 +1456,7 @@ func toolFindDeclaration(repoRoot string, args map[string]any) (string, error) {
 	pat := argString(args, "regex")
 	containing := argString(args, "containing_symbol_name_path")
 	incBody := argBool(args, "include_body", false)
+	incInfo := argBool(args, "include_info", false)
 	absFile, err := resolveRepoPath(repoRoot, rel)
 	if err != nil {
 		return "", err
@@ -1374,10 +1509,18 @@ func toolFindDeclaration(repoRoot string, args map[string]any) (string, error) {
 	var b strings.Builder
 	for _, r := range refs {
 		fmt.Fprintf(&b, "%s:L%d:%d  %s\n", r.RelPath, r.Line, r.Col+1, r.Preview)
+		if incInfo {
+			defAbs := filepath.Join(repoRoot, filepath.FromSlash(r.RelPath))
+			if defLang := detectLSPLang(defAbs); defLang != "" {
+				if h := queryWarmLSPHover(repoRoot, defLang, defAbs, r.Line-1, r.Col); h != "" {
+					fmt.Fprintf(&b, "  hover: %s\n", firstLineTrimmed(h))
+				}
+			}
+		}
 		if incBody {
 			defAbs := filepath.Join(repoRoot, filepath.FromSlash(r.RelPath))
 			if defSrc, derr := os.ReadFile(defAbs); derr == nil {
-				if syms, _, serr := extractFileSymbols(defAbs, r.RelPath, defSrc); serr == nil {
+				if syms, _, serr := extractFileSymbolsCached(defAbs, r.RelPath, defSrc); serr == nil {
 					for _, s := range flattenSymbols(syms) {
 						if r.Line >= s.StartLine && r.Line <= s.EndLine && int(s.EndByte) <= len(defSrc) {
 							b.WriteString("```\n")
@@ -1440,43 +1583,81 @@ func toolGetDiagnosticsForFile(repoRoot string, args map[string]any) (string, er
 	}
 
 	var lines []string
-	// 1. Instant AST syntax check
-	if src, rerr := os.ReadFile(absFile); rerr == nil {
-		if syn := checkSyntaxQuick(absFile, src); syn != "" {
-			lines = append(lines, strings.Split(syn, "\n")...)
+	seen := map[string]bool{}
+	addLine := func(s string) {
+		if s != "" && !seen[s] {
+			seen[s] = true
+			lines = append(lines, s)
 		}
 	}
-	// 2. Live LSP diagnostics
-	if lang := detectLSPLang(absFile); lang != "" {
-		if resp, lerr := ensureAndQueryLSP(repoRoot, lang, lspIPCReq{Action: "diagnostics", File: absFile}, false); lerr == nil {
-			for _, d := range resp.Diagnostics {
-				ln := d.Range.Start.Line + 1
-				if startLine > 0 && ln < startLine {
-					continue
+	// 1. Instant AST syntax check (honoring start_line / end_line filter)
+	if src, rerr := os.ReadFile(absFile); rerr == nil {
+		if strings.EqualFold(filepath.Ext(absFile), ".go") {
+			if syn := checkGoSyntaxStdlib(absFile, src); syn != "" {
+				for _, sl := range strings.Split(syn, "\n") {
+					addLine(sl)
 				}
-				if endLine > 0 && ln > endLine {
-					continue
-				}
-				sev := d.Severity
-				if sev == 0 {
-					sev = 1
-				}
-				if sev > maxSevNum {
-					continue
-				}
-				sevName := map[int]string{1: "error", 2: "warning", 3: "info", 4: "hint"}[sev]
-				srcTag := d.Source
-				if srcTag == "" {
-					srcTag = lang + "-lsp"
-				}
-				lines = append(lines, fmt.Sprintf("%s:%d:%d [%s/%s] %s", rel, ln, d.Range.Start.Character+1, srcTag, sevName, firstLineTrimmed(d.Message)))
 			}
-		} else {
-			// Also include fast oxlint/ty if LSP wasn't available
-			if quick := checkFileQuick(absFile); quick != "" {
-				lines = append(lines, strings.Split(quick, "\n")...)
+		} else if _, diags, perr := extractFileSymbolsCached(absFile, rel, src); perr == nil {
+			for _, d := range diags {
+				if startLine > 0 && d.Line < startLine {
+					continue
+				}
+				if endLine > 0 && d.Line > endLine {
+					continue
+				}
+				addLine(fmt.Sprintf("%s:%d:%d [syntax/error] %s", rel, d.Line, d.Col, d.Message))
 			}
 		}
+	}
+	// 2. Fast linters (oxlint/ty) always merged in parallel with LSP diagnostics
+	var (
+		linterOut []string
+		lspResp   *lspIPCResp
+		lspErr    error
+		wg        sync.WaitGroup
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		linterOut, _ = runFastLinters(absFile)
+	}()
+	if lang := detectLSPLang(absFile); lang != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			lspResp, lspErr = ensureAndQueryLSP(repoRoot, lang, lspIPCReq{Action: "diagnostics", File: absFile}, false)
+		}()
+	}
+	wg.Wait()
+
+	if lspErr == nil && lspResp != nil {
+		lang := detectLSPLang(absFile)
+		for _, d := range lspResp.Diagnostics {
+			ln := d.Range.Start.Line + 1
+			if startLine > 0 && ln < startLine {
+				continue
+			}
+			if endLine > 0 && ln > endLine {
+				continue
+			}
+			sev := d.Severity
+			if sev == 0 {
+				sev = 1
+			}
+			if sev > maxSevNum {
+				continue
+			}
+			sevName := map[int]string{1: "error", 2: "warning", 3: "info", 4: "hint"}[sev]
+			srcTag := d.Source
+			if srcTag == "" {
+				srcTag = lang + "-lsp"
+			}
+			addLine(fmt.Sprintf("%s:%d:%d [%s/%s] %s", rel, ln, d.Range.Start.Character+1, srcTag, sevName, firstLineTrimmed(d.Message)))
+		}
+	}
+	for _, lo := range linterOut {
+		addLine(lo)
 	}
 	if len(lines) == 0 {
 		return fmt.Sprintf("No diagnostics in %s.", rel), nil
@@ -1498,7 +1679,7 @@ type lspTextEdit struct {
 	NewText string `json:"newText"`
 }
 
-func lineColToByteOffset(src []byte, line0, col0 int) int {
+func lineColToByteOffset(src []byte, line0, col0 int, posEnc string) int {
 	curLine := 0
 	idx := 0
 	for idx < len(src) && curLine < line0 {
@@ -1507,19 +1688,14 @@ func lineColToByteOffset(src []byte, line0, col0 int) int {
 		}
 		idx++
 	}
-	// Advance col0 bytes/UTF-16 units conservatively within line
 	endLine := idx
 	for endLine < len(src) && src[endLine] != '\n' {
 		endLine++
 	}
-	pos := idx + col0
-	if pos > endLine {
-		pos = endLine
-	}
-	return pos
+	return idx + lspColToByteCol(src[idx:endLine], col0, posEnc)
 }
 
-func applyWorkspaceEdit(repoRoot string, raw json.RawMessage) (string, error) {
+func applyWorkspaceEdit(repoRoot string, raw json.RawMessage, posEnc string) (string, error) {
 	var we struct {
 		Changes         map[string][]lspTextEdit `json:"changes"`
 		DocumentChanges []struct {
@@ -1557,12 +1733,15 @@ func applyWorkspaceEdit(repoRoot string, raw json.RawMessage) (string, error) {
 		if _, err := resolveRepoPath(repoRoot, f); err != nil {
 			return "", fmt.Errorf("refusing edit outside repo: %w", err)
 		}
+		unlock := lockFileWrite(f)
 		info, err := os.Stat(f)
 		if err != nil {
+			unlock()
 			return "", err
 		}
 		src, err := os.ReadFile(f)
 		if err != nil {
+			unlock()
 			return "", err
 		}
 		edits := byFile[f]
@@ -1575,8 +1754,8 @@ func applyWorkspaceEdit(repoRoot string, raw json.RawMessage) (string, error) {
 		})
 		cur := src
 		for _, e := range edits {
-			sb := lineColToByteOffset(cur, e.Range.Start.Line, e.Range.Start.Character)
-			eb := lineColToByteOffset(cur, e.Range.End.Line, e.Range.End.Character)
+			sb := lineColToByteOffset(cur, e.Range.Start.Line, e.Range.Start.Character, posEnc)
+			eb := lineColToByteOffset(cur, e.Range.End.Line, e.Range.End.Character, posEnc)
 			if sb > eb || eb > len(cur) {
 				continue
 			}
@@ -1587,8 +1766,10 @@ func applyWorkspaceEdit(repoRoot string, raw json.RawMessage) (string, error) {
 			cur = buf.Bytes()
 			totalEdits++
 		}
-		if err := atomicWriteFile(f, cur, info.Mode().Perm()); err != nil {
-			return "", err
+		werr := atomicWriteFile(f, cur, info.Mode().Perm())
+		unlock()
+		if werr != nil {
+			return "", werr
 		}
 		rel, _ := filepath.Rel(repoRoot, f)
 		fmt.Fprintf(&b, "- %s (%d edits)\n", filepath.ToSlash(rel), len(edits))
@@ -1621,7 +1802,7 @@ func toolRenameSymbol(repoRoot string, args map[string]any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return applyWorkspaceEdit(repoRoot, resp.Edit)
+	return applyWorkspaceEdit(repoRoot, resp.Edit, resp.PosEncoding)
 }
 
 func toolSafeDeleteSymbol(repoRoot string, args map[string]any) (string, error) {
@@ -1630,6 +1811,12 @@ func toolSafeDeleteSymbol(repoRoot string, args map[string]any) (string, error) 
 	if np == "" {
 		np = argString(args, "name_path")
 	}
+	targetPath, err := resolveRepoPath(repoRoot, rel)
+	if err != nil {
+		return "", err
+	}
+	unlock := lockFileWrite(targetPath)
+	defer unlock()
 	sym, absFile, src, perm, err := resolveSingleSymbolInFile(repoRoot, rel, np)
 	if err != nil {
 		return "", err
