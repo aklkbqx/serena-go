@@ -1,0 +1,22 @@
+# Compiled binaries & release artifacts
+serena
+serena.new
+serena-go
+serena-go.new
+serena-darwin-arm64
+dist/
+*.exe
+*.test
+*.out
+coverage.out
+
+# OS & editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Local runtime state
+.serena/
+*.sock
+*.log
+*.pid
